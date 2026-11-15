@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 从 [Releases](../../releases) 下载 `ranpix.fpk`（或直接使用仓库根目录的 `ranpix.fpk`）。
+1. 从 [最新 Release](https://github.com/le5inioo/ranpix/releases/latest) 下载 `ranpix.fpk`（或直接使用仓库根目录的 `ranpix.fpk`）。
 2. 飞牛 OS → 应用中心 → 右上角菜单 → 安装本地包，选择 `ranpix.fpk`。
 3. 安装向导里可设置：
    - **服务端口**：默认 `18580`，改成未被占用的端口；
