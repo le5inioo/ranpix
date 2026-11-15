@@ -1,0 +1,32 @@
+[
+  {
+    "stepTitle": "RanPix 设置",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "修改后保存即可生效。也可以直接打开应用管理页，在页面顶部修改，效果相同。"
+      },
+      {
+        "type": "text",
+        "field": "RANPIX_PORT",
+        "label": "服务端口",
+        "initValue": "18580",
+        "rules": [
+          { "required": true, "message": "请输入服务端口" },
+          { "pattern": "^[0-9]{4,5}$", "message": "请输入 1000-65535 之间的端口号" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "RANPIX_IMAGE_ROOT",
+        "label": "图片根目录（留空恢复默认共享目录）",
+        "initValue": "",
+        "rules": []
+      },
+      {
+        "type": "tips",
+        "helpText": "使用自定义目录前，请确认已在「设置 → 应用管理 → RanPix → 权限设置」中授权该目录。管理页会显示目录可读性自检结果。"
+      }
+    ]
+  }
+]

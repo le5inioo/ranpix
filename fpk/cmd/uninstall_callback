@@ -1,0 +1,7 @@
+#!/bin/bash
+# Only clean runtime state. Image folders and user data are never deleted.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+APP="ranpix"
+VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
+rm -f "$VAR/server.pid"
+exit 0

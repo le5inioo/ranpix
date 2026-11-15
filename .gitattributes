@@ -1,0 +1,15 @@
+# Keep scripts and source LF on all platforms (NAS runs Linux)
+*.py text eol=lf
+*.sh text eol=lf
+manifest text eol=lf
+cmd/* text eol=lf
+wizard/* text eol=lf
+config/* text eol=lf
+fpk/app/server.py text eol=lf
+fpk/cmd/* text eol=lf
+fpk/wizard/* text eol=lf
+fpk/config/* text eol=lf
+fpk/manifest text eol=lf
+*.fpk binary
+*.png binary
+*.PNG binary

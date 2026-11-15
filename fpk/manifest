@@ -1,0 +1,13 @@
+appname               = ranpix
+version               = 1.1.1
+changelog             = 桌面与手机 App 入口改走飞牛同源网关，外网 / HTTPS 均可打开；端口自定义不再影响图标。
+display_name          = RanPix
+desc                  = 一个轻量的随机图片API 应用· 每个子文件夹就是一个独立随机图片接口
+platform              = x86
+source                = thirdparty
+maintainer            = local
+distributor           = local
+desktop_uidir         = ui
+desktop_applaunchname = ranpix.Application
+service_port          = 18580
+ctl_stop              = true

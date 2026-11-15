@@ -1,0 +1,120 @@
+#!/bin/bash
+# fnOS lifecycle: start | stop | status
+# The listening port comes from TRIM_PKGETC/config.json, which is written by
+# the install wizard, the settings page and the web management page.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+APP="ranpix"
+VAR="${TRIM_PKGVAR:-/var/apps/$APP/var}"
+ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
+APPDIR="${TRIM_APPDEST:-/var/apps/$APP}"
+CFG="$ETC/config.json"
+PIDFILE="$VAR/server.pid"
+LOGFILE="$VAR/stdout.log"
+TMPLOG="${TRIM_TEMP_LOGFILE:-/dev/null}"
+
+fail() {
+  echo "$1" > "$TMPLOG" 2>/dev/null
+  echo "$1" >> "$LOGFILE" 2>/dev/null
+  exit 1
+}
+
+current_port() {
+  python3 - "$CFG" <<'PY'
+import json, os, sys
+p = 0
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        p = int(json.load(fh).get("port") or 0)
+except (OSError, ValueError):
+    pass
+if not 1024 <= p <= 65535:
+    try:
+        p = int(os.environ.get("RANPIX_PORT") or os.environ.get("TRIM_SERVICE_PORT") or 0)
+    except ValueError:
+        p = 0
+print(p if 1024 <= p <= 65535 else 18580)
+PY
+}
+
+find_python() {
+  for candidate in /usr/bin/python3 /usr/local/bin/python3 /bin/python3; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  command -v python3 2>/dev/null
+}
+
+pid_alive() {
+  [ -f "$PIDFILE" ] || return 1
+  pid=$(cat "$PIDFILE" 2>/dev/null)
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+case "$1" in
+  start)
+    if pid_alive; then
+      exit 0
+    fi
+    mkdir -p "$VAR" || fail "无法创建数据目录 $VAR"
+    PY=$(find_python) || fail "系统未找到 python3，无法启动 RanPix"
+    SRC=""
+    for d in "$APPDIR" "$APPDIR/target" "/var/apps/$APP/target"; do
+      if [ -f "$d/server.py" ]; then
+        SRC="$d/server.py"
+        break
+      fi
+    done
+    [ -n "$SRC" ] || fail "找不到 server.py（已检查 $APPDIR 与 target 子目录）"
+    PORT="$(current_port)"
+    export RANPIX_PORT="$PORT"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$PY" "$SRC" >> "$LOGFILE" 2>&1 < /dev/null &
+    else
+      nohup "$PY" "$SRC" >> "$LOGFILE" 2>&1 < /dev/null &
+    fi
+    echo $! > "$PIDFILE"
+    i=0
+    while [ "$i" -lt 20 ]; do
+      pid_alive || fail "进程启动后立即退出，请查看 $LOGFILE"
+      if command -v curl >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/_health" >/dev/null 2>&1; then
+          exit 0
+        fi
+      else
+        pid_alive && exit 0
+      fi
+      sleep 0.3
+      i=$((i + 1))
+    done
+    fail "RanPix 未能在 $PORT 端口就绪，请查看 $LOGFILE"
+    ;;
+  stop)
+    if pid_alive; then
+      pid=$(cat "$PIDFILE")
+      kill "$pid" 2>/dev/null
+      i=0
+      while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.3
+        i=$((i + 1))
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+      fi
+    fi
+    rm -f "$PIDFILE"
+    exit 0
+    ;;
+  status)
+    if pid_alive; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    exit 1
+    ;;
+esac

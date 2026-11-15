@@ -1,0 +1,36 @@
+[
+  {
+    "stepTitle": "欢迎安装 RanPix",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "RanPix 是原生运行的随机图片 API。图片根目录下的每个一级子文件夹自动成为一个独立接口，例如放入 anime/ 后访问 /anime 即可随机返回一张图。安装后可随时在「应用设置」或管理页修改端口与图片根目录。"
+      },
+      {
+        "type": "text",
+        "field": "RANPIX_PORT",
+        "label": "服务端口",
+        "initValue": "18580",
+        "rules": [
+          { "required": true, "message": "请输入服务端口" },
+          { "pattern": "^[0-9]{4,5}$", "message": "请输入 1000-65535 之间的端口号" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "请避开已占用的端口（飞牛常用端口、其它应用端口）。桌面与手机 App 入口走飞牛同源网关，修改端口不会影响图标打开。"
+      },
+      {
+        "type": "text",
+        "field": "RANPIX_IMAGE_ROOT",
+        "label": "图片根目录（可留空）",
+        "initValue": "",
+        "rules": []
+      },
+      {
+        "type": "tips",
+        "helpText": "留空 = 使用应用自带共享目录 /vol1/@appshare/ranpix（推荐，权限已自动就绪）。<br>如需使用 NAS 上已有的文件夹，请填写绝对路径，例如 /vol1/1000/Pictures；<b>安装后还需到「设置 → 应用管理 → RanPix → 权限设置」授权该文件夹</b>，否则应用专用用户读不到图片。"
+      }
+    ]
+  }
+]

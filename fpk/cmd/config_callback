@@ -1,0 +1,76 @@
+#!/bin/bash
+# Called after the user saves the wizard/config page. Persist the answers and
+# ask the running service to reload (the service re-execs itself in place,
+# so its PID stays valid for cmd/main status).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+APP="ranpix"
+CFG="${TRIM_PKGETC:-/var/apps/$APP/etc}/config.json"
+TMPLOG="${TRIM_TEMP_LOGFILE:-/dev/null}"
+
+OLD="$(python3 - "$CFG" "${RANPIX_PORT:-}" "${RANPIX_IMAGE_ROOT:-}" <<'PY'
+import json, os, socket, sys
+path, new_port, new_root = sys.argv[1], sys.argv[2].strip(), sys.argv[3].strip()
+old = {}
+try:
+    with open(path, encoding="utf-8") as fh:
+        old = json.load(fh)
+except (OSError, ValueError):
+    pass
+old_port = int(old.get("port") or 18580)
+
+# Nothing submitted (e.g. fnOS did not inject the fields) -> keep config intact.
+if not new_port and not new_root:
+    print(old_port)
+    sys.exit(0)
+
+cfg = dict(old)
+cfg.setdefault("image_root", "")
+cfg.setdefault("cache_ttl", 30)
+if new_root:
+    root = os.path.normpath(new_root)
+    if not os.path.isabs(root) or root in ("/", "/etc", "/proc", "/sys", "/dev", "/boot", "/root"):
+        print("ERR:invalid image_root %s" % root, file=sys.stderr)
+        print(old_port)
+        sys.exit(0)
+    cfg["image_root"] = root
+else:
+    cfg["image_root"] = ""
+
+if new_port:
+    try:
+        p = int(new_port)
+    except ValueError:
+        print("ERR:invalid port %s" % new_port, file=sys.stderr)
+        print(old_port)
+        sys.exit(0)
+    if not 1024 <= p <= 65535:
+        print("ERR:port out of range %s" % p, file=sys.stderr)
+        print(old_port)
+        sys.exit(0)
+    if p != old_port:
+        s = socket.socket()
+        try:
+            s.bind(("0.0.0.0", p))
+        except OSError as exc:
+            print("ERR:port %s busy: %s" % (p, exc), file=sys.stderr)
+            print(old_port)
+            sys.exit(0)
+        finally:
+            s.close()
+    cfg["port"] = p
+
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+try:
+    os.chmod(path, 0o666)
+except OSError:
+    pass
+print(old_port)
+PY
+)" 2>> "$TMPLOG"
+OLD_PORT="$(printf '%s' "$OLD" | tail -1)"
+
+if [ -n "$OLD_PORT" ] && command -v curl >/dev/null 2>&1; then
+  curl -fsS --max-time 3 -X POST "http://127.0.0.1:$OLD_PORT/_reload" >/dev/null 2>&1 || true
+fi
+exit 0

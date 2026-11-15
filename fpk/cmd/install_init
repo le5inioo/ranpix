@@ -1,0 +1,10 @@
+#!/bin/bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+for candidate in /usr/bin/python3 /usr/local/bin/python3 /bin/python3; do
+  [ -x "$candidate" ] && exit 0
+done
+if command -v python3 >/dev/null 2>&1; then
+  exit 0
+fi
+echo "系统未找到 python3，无法安装 RanPix" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+exit 1

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Keep existing configuration; generate defaults only when missing.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+APP="ranpix"
+CFG="${TRIM_PKGETC:-/var/apps/$APP/etc}/config.json"
+if [ -f "$CFG" ]; then
+  chmod 666 "$CFG" 2>/dev/null || true
+  exit 0
+fi
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/install_callback"

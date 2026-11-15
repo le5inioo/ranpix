@@ -1,0 +1,32 @@
+#!/bin/bash
+# Create config.json from the wizard answers (RANPIX_PORT / RANPIX_IMAGE_ROOT).
+# Existing config is preserved so upgrades keep user customisation.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+APP="ranpix"
+ETC="${TRIM_PKGETC:-/var/apps/$APP/etc}"
+mkdir -p "$ETC" 2>/dev/null
+CFG="$ETC/config.json"
+
+python3 - "$CFG" "${RANPIX_PORT:-}" "${RANPIX_IMAGE_ROOT:-}" <<'PY'
+import json, os, sys
+path, port, root = sys.argv[1], sys.argv[2].strip(), sys.argv[3].strip()
+if os.path.isfile(path):
+    print("config already exists, kept:", path)
+    sys.exit(0)
+try:
+    p = int(port) if port else 18580
+except ValueError:
+    p = 18580
+if not 1024 <= p <= 65535:
+    p = 18580
+cfg = {"image_root": root, "cache_ttl": 30, "port": p}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+try:
+    os.chmod(path, 0o666)   # the package user must be able to edit it
+except OSError:
+    pass
+print("config created:", cfg)
+PY
+chmod 666 "$CFG" 2>/dev/null || true
+exit 0

@@ -1,0 +1,21 @@
+{
+    ".url": {
+        "ranpix.Application": {
+            "title": "RanPix",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "port": "",
+            "url": "/app/ranpix/",
+            "allUsers": true,
+            "gatewaySocket": "ranpix.sock",
+            "gatewayPrefix": "/app/ranpix",
+            "control": {
+                "accessPerm": "readonly",
+                "portPerm": "hidden",
+                "pathPerm": "hidden",
+                "fullUrlPerm": "hidden"
+            }
+        }
+    }
+}

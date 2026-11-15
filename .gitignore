@@ -1,0 +1,8 @@
+# Runtime artifacts (not part of the package source)
+**/var/
+**/*.log
+**/*.sock
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
