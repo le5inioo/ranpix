@@ -12,8 +12,14 @@
         "label": "服务端口",
         "initValue": "18580",
         "rules": [
-          { "required": true, "message": "请输入服务端口" },
-          { "pattern": "^[0-9]{4,5}$", "message": "请输入 1000-65535 之间的端口号" }
+          {
+            "required": true,
+            "message": "请输入服务端口"
+          },
+          {
+            "pattern": "^[0-9]{4,5}$",
+            "message": "请输入 1000-65535 之间的端口号"
+          }
         ]
       },
       {

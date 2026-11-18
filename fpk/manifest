@@ -1,8 +1,8 @@
 appname               = ranpix
-version               = 1.1.1
-changelog             = 桌面与手机 App 入口改走飞牛同源网关，外网 / HTTPS 均可打开；端口自定义不再影响图标。
+version               = 2.0.0
+changelog             = RanPix 2.0.0：新增 Wallhaven 壁纸采集（多任务/周几定时/顺序下载/全局 API Key/黑名单）与图片压缩任务（系统 ffmpeg），采集与压缩均可定时循环；含短边缩放、顺序预览、删除拉黑。
 display_name          = RanPix
-desc                  = 一个轻量的随机图片API 应用· 每个子文件夹就是一个独立随机图片接口
+desc                  = 一个轻量的随机图片API 应用 · 每个子文件夹就是一个独立随机图片接口 · 支持 Wallhaven 采集与图片压缩任务
 platform              = x86
 source                = thirdparty
 maintainer            = local

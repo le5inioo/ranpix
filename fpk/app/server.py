@@ -21,21 +21,26 @@ import html
 import ipaddress
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import socket
 import socketserver
+import ssl
+import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from string import Template
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 APPNAME = "ranpix"
 APP_TITLE = "RanPix"
-VERSION = "1.1.1"
+VERSION = "2.0.0"
 DEFAULT_PORT = 18580
 GATEWAY_PREFIX = "/app/ranpix"
 SOCKET_NAME = "ranpix.sock"
@@ -104,9 +109,8 @@ def valid_root(value):
         with os.scandir(path) as it:
             next(it, None)
     except OSError as exc:
-        return "", ("目录不可读：%s。顶层文件夹到「设置 → 应用管理 → RanPix → 权限设置」授权；"
-                    "子文件夹到「文件管理 → 详细信息 → 权限 → 高级」启用继承父级权限"
-                    % (exc.strerror or "权限不足"))
+        return "", "目录不可读：%s。本次设置未保存（授权方法见「使用说明」）" % (
+            exc.strerror or "权限不足")
     return path, ""
 
 
@@ -203,6 +207,100 @@ def save_config(cfg):
         os.chmod(CONFIG_PATH, 0o666)
     except OSError:
         pass
+
+
+# Global deletion blacklist. A wallhaven ID added here is skipped by every
+# collection task, regardless of category; the file lives beside config.json
+# in ETC_DIR so it survives app updates and is shared across all tasks.
+BLACKLIST_PATH = os.path.join(ETC_DIR, "blacklist.json")
+_blacklist_lock = threading.RLock()
+
+
+def image_wid(path):
+    """Return the wallhaven id from a stored filename.
+
+    Collected files are named wallhaven-<id>.<ext> and downloaded.txt stores
+    the bare <id>; both match the API item's `id` used by the collector.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.lower().startswith("wallhaven-"):
+        return stem[len("wallhaven-"):].strip().lower()
+    return ""
+
+
+def load_blacklist():
+    with _blacklist_lock:
+        try:
+            with open(BLACKLIST_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                data = data.get("ids")
+            if isinstance(data, list):
+                return {str(x).strip().lower() for x in data if str(x).strip()}
+        except (OSError, ValueError):
+            pass
+        return set()
+
+
+def save_blacklist(ids):
+    with _blacklist_lock:
+        tmp = BLACKLIST_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"ids": sorted(ids)}, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, BLACKLIST_PATH)
+        try:
+            os.chmod(BLACKLIST_PATH, 0o666)
+        except OSError:
+            pass
+
+
+def add_blacklist(wid):
+    wid = str(wid or "").strip().lower()
+    if not wid:
+        return False
+    with _blacklist_lock:
+        ids = load_blacklist()
+        if wid in ids:
+            return False
+        ids.add(wid)
+        save_blacklist(ids)
+    return True
+
+
+def delete_preview_image(category, index):
+    """Delete the image shown at `index` in the preview's mtime-desc order.
+
+    Mirrors the `order=recent&i=N` lookup in route() exactly so what the user
+    sees is what gets removed. Returns (ok, payload).
+    """
+    cats = categories()
+    canonical, _amb = resolve_category(category, cats)
+    if canonical is None or not cats.get(canonical):
+        return False, "分类不存在或无图片"
+    ordered = sorted(cats[canonical], key=lambda p: (_mtime_of(p), p), reverse=True)
+    if not ordered:
+        return False, "分类无图片"
+    idx = index % len(ordered)          # preview wraps around at the end
+    target = ordered[idx]
+    wid = image_wid(target)
+    name = os.path.basename(target)
+    try:
+        os.unlink(target)
+    except OSError as exc:
+        return False, "删除失败：%s" % exc
+    if wid:
+        add_blacklist(wid)
+    _cache["ts"] = 0.0                  # refresh gallery scan immediately
+    log("deleted image: %s (wid=%s or empty)" % (target, wid or "n/a"))
+    return True, {"ok": True, "deleted": name, "wid": wid,
+                  "blacklisted": bool(wid)}
+
+
+def _mtime_of(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return 0.0
 
 
 def schedule_execv():
@@ -321,38 +419,1076 @@ def root_status(cfg):
     return info
 
 
+# ---------------------------------------------------------------------------
+# Wallhaven collector (stage 1)
+#
+# Ported from the user's Wallhaven-Downloader-CN bash scripts, but using only
+# the Python standard library so the fpk stays dependency-free. The API v1
+# response already carries `path`, `favorites` and `file_size`, so we no
+# longer need wget --spider / jq / shuf.
+# ---------------------------------------------------------------------------
+
+FETCH_DEFAULTS = {
+    # api_key is global (fetch.json); kept here only for legacy task configs.
+    "api_key": "",
+    "target": "Wallhaven",
+    "count": 24,
+    "categories": "111",       # general / anime / people bitmask
+    "purity": "100",           # sfw / sketchy / nsfw bitmask
+    "ratios": "",              # "" = any; e.g. landscape,portrait,16x9
+    "sorting": "hot",          # hot / toplist / favorites / views
+    "short_edge": 0,           # >= px on the short side; 0 = any
+    "start_page": 0,           # 0 = random page
+    "end_page": 0,             # 0 = unlimited (capped by API last_page)
+    "min_favorites": 0,        # 0 = any
+    "min_size_kb": 0,          # 0 = any
+    "max_size_mb": 0,          # 0 = any
+    "query": "",
+    "clear_before": 0,         # 1 = empty the target category folder before collecting
+    "max_pages": 500,          # internal safety cap
+}
+# Values the Wallhaven API actually honours. The three UI group names
+# (wide/ultrawide/square) were never valid API params; they are now expanded
+# into concrete ratios below so old tasks keep working after the UI change.
+VALID_RATIOS = ("landscape", "portrait",
+                "16x9", "16x10", "3x2", "4x3", "5x4",
+                "21x9", "32x9", "48x9",
+                "9x16", "10x16", "9x18", "1x1")
+RATIO_ALIAS = {
+    "wide": "16x9,16x10,3x2,4x3,5x4",
+    "ultrawide": "21x9,32x9,48x9",
+    "square": "1x1",                    # old "正方形" value -> real API value
+}
+VALID_SORTING = ("hot", "toplist", "favorites", "views")
+FETCH_CONFIG_PATH = os.path.join(ETC_DIR, "fetch.json")
+WH_API = "https://wallhaven.cc/api/v1/search"
+WH_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+
+_fetch_lock = threading.Lock()
+_cancel = threading.Event()
+_fetch_state = {
+    "running": False, "phase": "idle", "done": 0, "total": 0,
+    "page": 0, "error": "", "started": 0, "finished": 0,
+    "target": "", "log": [],
+}
+
+
+def load_fetch_config():
+    cfg = dict(FETCH_DEFAULTS)
+    try:
+        with open(FETCH_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            cfg.update({k: v for k, v in data.items() if k in cfg})
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_fetch_config(cfg):
+    clean = {}
+    for key, default in FETCH_DEFAULTS.items():
+        clean[key] = cfg.get(key, default)
+    with open(FETCH_CONFIG_PATH, "w", encoding="utf-8") as fh:
+        json.dump(clean, fh, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(FETCH_CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def fetch_valid(cfg):
+    """Validate and coerce a user-submitted collector config."""
+    out = dict(FETCH_DEFAULTS)
+    out["api_key"] = str(cfg.get("api_key") or "").strip()
+    target = str(cfg.get("target") or "").strip()
+    if not target or not SAFE_NAME.match(target) or ".." in target or target.startswith("."):
+        return None, "目标分类名不合法（不能含 / \\ 或以 . 开头）"
+    out["target"] = target
+    for key, lo, hi in (("count", 1, 200), ("min_favorites", 0, 100000),
+                        ("min_size_kb", 0, 102400), ("max_size_mb", 0, 2000),
+                        ("max_pages", 1, 500), ("short_edge", 0, 10000),
+                        ("start_page", 0, 500), ("end_page", 0, 500)):
+        raw = cfg.get(key)
+        try:
+            val = int(raw) if raw not in (None, "") else out[key]
+        except (TypeError, ValueError):
+            return None, "%s 必须是数字" % key
+        if not lo <= val <= hi:
+            return None, "%s 需在 %d-%d 之间" % (key, lo, hi)
+        out[key] = val
+    if out["start_page"] and out["end_page"] and out["start_page"] > out["end_page"]:
+        return None, "起始页码不能大于结束页码"
+    if (out["max_size_mb"] and out["min_size_kb"]
+            and out["max_size_mb"] * 1024 <= out["min_size_kb"]):
+        return None, "文件大小上限必须大于下限"
+    for key in ("categories", "purity"):
+        val = str(cfg.get(key) or out[key])
+        if len(val) != 3 or any(c not in "01" for c in val) or "1" not in val:
+            return None, "%s 至少启用一项（3 位 0/1 组合）" % key
+        out[key] = val
+    ratios = [x.strip().lower() for x in str(cfg.get("ratios") or "").split(",")]
+    expanded = []
+    for r in ratios:
+        if not r:
+            continue
+        # Migrate legacy UI group names to concrete API ratios.
+        for part in RATIO_ALIAS.get(r, r).split(","):
+            if part and part not in expanded:
+                expanded.append(part)
+    for r in expanded:
+        if r not in VALID_RATIOS:
+            return None, "比例不支持：%s" % r
+    out["ratios"] = ",".join(expanded)
+    sorting = str(cfg.get("sorting") or out["sorting"]).strip().lower()
+    if sorting not in VALID_SORTING:
+        return None, "排序方式不支持（可用：热门/最近一周/收藏量/浏览量）"
+    out["sorting"] = sorting
+    out["query"] = str(cfg.get("query") or "").strip()[:120]
+    out["clear_before"] = 1 if str(cfg.get("clear_before") or "").strip().lower() \
+        in ("1", "true", "on", "yes") else 0
+    return out, ""
+
+
+def apply_global_key(cfg):
+    """Use the global API key; without one, Wallhaven only serves SFW content.
+
+    This is the single enforcement point for the table's rule
+    "API Key 留空则仅下载 SFW": sketchy/NSFW purity is silently collapsed to
+    SFW at save time and again just before a job runs, so an old task can
+    never download NSFW after the key is cleared.
+    """
+    key = ""
+    try:
+        with open(FETCH_CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            key = str(data.get("api_key") or "").strip()
+    except (OSError, ValueError):
+        pass
+    cfg["api_key"] = key
+    if not key:
+        cfg["purity"] = "100"
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Image compression task config. Reuses the same task/scheduler/worker as the
+# Wallhaven collector; only the job body differs (compress_images below).
+# All paths are absolute and configurable because the app user may not have
+# access to the paths hard-coded in the original compress.sh.
+# ---------------------------------------------------------------------------
+COMPRESS_DEFAULTS = {
+    "src_dir": "/vol2/1000/Media/Wallhaven",          # images to compress (this dir only)
+    "backup_dir": "/vol2/1000/Media/Image/Wall-Backup",  # original full-quality copies
+    "max_height": 2160,        # resize short-edge ceiling (kept key name for compatibility); 0 = no resize
+    "max_size_mb": 5,          # file size ceiling in MB; 0 = no size compression
+    "q_max": 98,               # highest JPEG quality while shrinking size
+    "q_min": 85,               # lowest JPEG quality (detail floor)
+    "to_jpg": 1,               # convert non-JPG formats to JPG
+    "recursive": 0,            # 1 = include subdirectories
+}
+COMPRESS_FORMATS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
+_COMPRESS_TOOLS = None        # lazily detected: ffmpeg / ffprobe (system bundled)
+
+
+def compress_valid(cfg):
+    """Validate and coerce a user-submitted compression config."""
+    out = dict(COMPRESS_DEFAULTS)
+    for key in ("src_dir", "backup_dir"):
+        raw = os.path.normpath(str(cfg.get(key) or "").strip())
+        if not raw or not os.path.isabs(raw):
+            return None, "%s 必须是绝对路径" % ("源目录" if key == "src_dir" else "备份目录")
+        if raw in FORBIDDEN_ROOTS or raw.startswith("/etc/") or raw.startswith("/proc/"):
+            return None, "出于安全考虑，不允许使用系统目录作为%s" % (
+                "源目录" if key == "src_dir" else "备份目录")
+        out[key] = raw
+    for key, lo, hi in (("max_height", 0, 20000), ("max_size_mb", 0, 2000),
+                        ("q_max", 1, 100), ("q_min", 1, 100)):
+        raw = cfg.get(key)
+        try:
+            val = int(raw) if raw not in (None, "") else out[key]
+        except (TypeError, ValueError):
+            return None, "%s 必须是数字" % key
+        if not lo <= val <= hi:
+            return None, "%s 需在 %d-%d 之间" % (key, lo, hi)
+        out[key] = val
+    if out["q_min"] > out["q_max"]:
+        return None, "质量下限不能高于上限"
+    for key in ("to_jpg", "recursive"):
+        out[key] = 1 if str(cfg.get(key, out[key])).strip() in ("1", "true", "on", "yes") else 0
+    return out, ""
+
+
+def compress_tools():
+    """Return (ffmpeg, ffprobe) paths; cached. Both ship with fnOS mediasrv."""
+    global _COMPRESS_TOOLS
+    if _COMPRESS_TOOLS is None:
+        import shutil as _sh
+        _COMPRESS_TOOLS = (_sh.which("ffmpeg"), _sh.which("ffprobe"))
+    return _COMPRESS_TOOLS
+
+
+def _imq_to_qscale(q):
+    """Map ImageMagick-style quality (1-100) to ffmpeg mjpeg -q:v (2-31).
+
+    Measured on fnOS ffmpeg 8.1: the IJG quality ffmpeg produces tracks
+    ``100 - qscale * 3.5`` closely, so the inverse gives an equivalent
+    visual quality. Lower qscale = higher quality.
+    """
+    try:
+        q = int(q)
+    except (TypeError, ValueError):
+        q = 85
+    return max(2, min(31, int(round((100 - q) / 3.5))))
+
+
+def _ffmpeg_decode_argv(ffmpeg, src):
+    """ffmpeg argv prefix that decodes one frame of any supported image."""
+    return [ffmpeg, "-v", "error", "-y", "-i", src, "-frames:v", "1"]
+
+
+def wh_request(url, api_key="", timeout=25):
+    headers = {"User-Agent": WH_UA, "Accept": "application/json, image/*"}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def wh_search(page, cfg):
+    params = {
+        "page": page,
+        "categories": cfg["categories"],
+        "purity": cfg["purity"],
+        "sorting": cfg["sorting"],
+    }
+    # "hot" is an intrinsic ranking; the API rejects `order` for it.
+    if cfg["sorting"] != "hot":
+        params["order"] = "desc"
+    if cfg["sorting"] == "toplist":
+        params["topRange"] = "1w"        # 最近一周 Toplist-LastWeek
+    if cfg.get("short_edge"):
+        # Wallhaven's atleast is a min width x min height. Using PxP is the
+        # exact way to require "短边 ≥ P" without knowing each image's ratio.
+        n = int(cfg["short_edge"])
+        params["atleast"] = "%dx%d" % (n, n)
+    if cfg.get("ratios"):
+        params["ratios"] = cfg["ratios"]
+    if cfg.get("query"):
+        params["q"] = cfg["query"]
+    raw = wh_request(WH_API + "?" + urlencode(params), cfg["api_key"])
+    return json.loads(raw.decode("utf-8"))
+
+
+def wh_fetch_image(item, cfg):
+    """Download one wallpaper, falling back to the thumbnail CDN.
+
+    w.wallhaven.cc (full-size) may be blocked on some networks / NAS boxes,
+    while th.wallhaven.cc is usually reachable. Thumb URLs are always .jpg
+    even when the original is .png, so the stored filename follows the source.
+
+    Returns (blob, filename, source_label) or raises the last error.
+    """
+    candidates = []
+    full = item.get("path") or ""
+    if full:
+        candidates.append((full, os.path.basename(unquote(urlparse(full).path)), "原图"))
+    thumbs = item.get("thumbs") or {}
+    for kind, label in (("original", "高清缩略"), ("large", "大图")):
+        u = thumbs.get(kind) or ""
+        if u:
+            candidates.append((u, os.path.basename(unquote(urlparse(u).path)), label))
+    if not candidates:
+        raise ValueError("API 未返回任何图片地址")
+    last = None
+    for url, name, label in candidates:
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in SUPPORTED or not SAFE_NAME.match(name):
+            continue
+        try:
+            return wh_request(url, cfg["api_key"], timeout=45), name, label
+        except Exception as exc:
+            last = exc
+            continue
+    raise last or ValueError("无可用图片地址")
+
+
+def _fetch_note(text, limit=80):
+    """Append one line to the in-memory task log (also written by log())."""
+    with _fetch_lock:
+        lines = _fetch_state["log"]
+        lines.append(text)
+        if len(lines) > limit:
+            del lines[:len(lines) - limit]
+    log("fetch: " + text)
+
+
+def _fetch_set(**kw):
+    with _fetch_lock:
+        _fetch_state.update(kw)
+
+
+def _fetch_fail(message, ctx=None):
+    """Finalise a job that failed before the main loop started."""
+    note = ctx["note"] if ctx else _fetch_note
+    setst = ctx["set"] if ctx else _fetch_set
+    note("采集失败：" + message)
+    setst(running=False, finished=time.time(), phase="error", error=message)
+
+
+class _LegacyFetchCtx:
+    """Adapter so wh_collect can drive the old global single-shot state."""
+    def set(self, **kw):
+        _fetch_set(**kw)
+
+    def note(self, text):
+        _fetch_note(text)
+
+    def cancelled(self):
+        return _cancel.is_set()
+
+    def wait(self, sec):
+        return _cancel.wait(sec)
+
+
+def wh_collect(cfg, ctx=None):
+    """Run one collection job. ctx may be a task-specific context providing
+    set/note/cancelled/wait; defaults to the legacy global single-shot state."""
+    ctx = ctx or _LegacyFetchCtx()
+    setst, note = ctx.set, ctx.note
+    root = load_config()["image_root"]
+    dest = os.path.join(root, cfg["target"])
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as exc:
+        _fetch_fail("无法创建目录 %s：%s" % (dest, exc), ctx)
+        return
+    if not os.access(dest, os.W_OK):
+        _fetch_fail("目录不可写：%s。请到 文件管理 → 详细信息 → 权限 中给应用用户写入权限" % dest, ctx)
+        return
+
+    # Optional: empty the target category folder before this run. Only plain
+    # files directly inside `dest` are removed (never subdirectories), so the
+    # category stays intact. downloaded.txt is a plain file and is removed too,
+    # giving this run a clean seen-set; the global blacklist is untouched.
+    if cfg.get("clear_before"):
+        removed = 0
+        try:
+            for entry in os.listdir(dest):
+                path = os.path.join(dest, entry)
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.unlink(path)
+                    removed += 1
+        except OSError as exc:
+            _fetch_fail("清空目标目录失败：%s" % exc, ctx)
+            return
+        note("开始前已清空目标分类文件夹（删除 %d 个文件）" % removed)
+
+    state_file = os.path.join(dest, "downloaded.txt")
+    seen = set()
+    try:
+        with open(state_file, "r", encoding="utf-8") as fh:
+            seen = {line.strip().lower() for line in fh if line.strip()}
+    except OSError:
+        pass
+    # Global deletion blacklist: images removed in the preview are recorded by
+    # wallhaven id here and must be skipped by every task, in any category.
+    blacklist = load_blacklist()
+    skipped_blacklist = [0]
+
+    setst(target=dest, done=0, total=cfg["count"], page=0, error="")
+    rng = "随机起始页"
+    if cfg["start_page"]:
+        rng = "第 %d 页起" % cfg["start_page"]
+    if cfg["end_page"]:
+        rng += " 至第 %d 页" % cfg["end_page"]
+    note("开始采集 → %s（目标 %d 张，%s，按接口顺序下载）" % (dest, cfg["count"], rng))
+
+    try:
+        first = wh_search(1, cfg)
+        last = int((first.get("meta") or {}).get("last_page") or 1)
+    except Exception as exc:
+        _fetch_fail("访问 wallhaven API 失败：%s" % exc, ctx)
+        return
+    if cfg["end_page"]:
+        last = min(last, cfg["end_page"])
+    last = max(1, min(last, cfg["max_pages"]))
+    # The start page is chosen exactly once: a non-zero start_page is used
+    # verbatim; 0 means pick ONE random page. From there on, pages increase
+    # sequentially and images follow the API's returned order.
+    first_page = cfg["start_page"] or random.randint(1, last)
+    if first_page > last:
+        note("起始页 %d 超出可用范围，改从第 %d 页开始" % (first_page, last))
+        first_page = last
+    first_page = max(1, first_page)
+    note("起始第 %d 页，可用页数 1-%d（第 1 页探测，安全上限 %d）"
+         % (first_page, last, cfg["max_pages"]))
+
+    min_size = cfg["min_size_kb"] * 1024
+    max_size = cfg["max_size_mb"] * 1024 * 1024 if cfg["max_size_mb"] else float("inf")
+    done = 0
+    next_page = first_page
+    rate_limited = 0
+
+    try:
+        while done < cfg["count"] and not ctx.cancelled() and next_page <= last:
+            page = next_page
+            setst(page=page)
+            note("抓取第 %d 页…" % page)
+            try:
+                data = wh_search(page, cfg)
+                rate_limited = 0
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    rate_limited += 1
+                    note("触发限流 429，冷却 30 秒（第 %d 次）" % rate_limited)
+                    if ctx.wait(30) or rate_limited >= 5:
+                        if rate_limited >= 5:
+                            note("连续限流过多，停止采集")
+                        break
+                    continue                   # keep next_page: retry same page
+                note("第 %d 页请求失败 HTTP %s，跳过" % (page, exc.code))
+                next_page = page + 1
+                continue
+            except Exception as exc:
+                note("第 %d 页请求失败 %s，跳过" % (page, exc))
+                next_page = page + 1
+                continue
+            next_page = page + 1
+
+            # Keep the API's order: "start at page 5" means page 5's first
+            # image first. Previously random.shuffle() broke this guarantee.
+            items = list(data.get("data") or [])
+            for it in items:
+                if done >= cfg["count"] or ctx.cancelled():
+                    break
+                fav = it.get("favorites") or 0
+                if fav < cfg["min_favorites"]:
+                    continue
+                size = it.get("file_size") or 0
+                if size and not min_size <= size <= max_size:
+                    continue
+                wid = it.get("id") or ""
+                wl = wid.strip().lower()
+                if not wl or wl in seen or wl in blacklist:
+                    if wl in blacklist:
+                        skipped_blacklist[0] += 1
+                    continue
+
+                tmp = ""
+                try:
+                    blob, name, label = wh_fetch_image(it, cfg)
+                    # Thumbnails are much smaller than the API-reported full
+                    # file size, so only the upper bound applies to them.
+                    if len(blob) > max_size or len(blob) < 2048:
+                        note("跳过 %s（实际 %d 字节不符）" % (name, len(blob)))
+                        continue
+                    if os.path.exists(os.path.join(dest, name)):
+                        seen.add(wid)
+                        continue
+                    tmp = os.path.join(dest, "." + name + ".part")
+                    with open(tmp, "wb") as fh:
+                        fh.write(blob)
+                    os.replace(tmp, os.path.join(dest, name))
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 429 and not ctx.wait(30):
+                        note("下载遇到 429，已等待 30 秒")
+                    note("下载失败 %s：HTTP %s" % (wid, exc.code))
+                    continue
+                except Exception as exc:
+                    note("下载失败 %s：%s" % (wid, exc))
+                    continue
+                finally:
+                    if tmp:
+                        try:
+                            if os.path.exists(tmp):
+                                os.unlink(tmp)
+                        except OSError:
+                            pass
+                seen.add(wl)
+                try:
+                    with open(state_file, "a", encoding="utf-8") as fh:
+                        fh.write(wid + "\n")
+                except OSError:
+                    pass
+                done += 1
+                setst(done=done)
+                note("已下载 %d/%d：%s（%s，%d KB，收藏 %s）"
+                            % (done, cfg["count"], name, label, len(blob) // 1024, fav))
+    finally:
+        _cache["ts"] = 0.0
+        cancelled = ctx.cancelled()
+        setst(running=False, finished=time.time(),
+                   phase="cancelled" if cancelled else "done",
+                   error="" if done or cancelled else "没有找到符合条件的图片，可放宽筛选条件")
+        extra = ("；黑名单跳过 %d 张" % skipped_blacklist[0]) if skipped_blacklist[0] else ""
+        note("采集结束，共 %d 张%s；接口列表已刷新" % (done, extra))
+
+
+def _run_tool(argv, timeout=180):
+    """Run an image tool; return (ok, stdout). Never raises."""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout)
+        return p.returncode == 0, (p.stdout or b"").decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+
+def _img_dims(ffprobe, path):
+    """Return (width, height) via ffprobe; (0, 0) when unreadable."""
+    ok, out = _run_tool([ffprobe, "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height",
+                         "-of", "csv=p=0", path], timeout=30)
+    if not ok:
+        return 0, 0
+    try:
+        parts = (out or "").splitlines()[0].strip().split(",")
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+def _img_height(ffprobe, path):
+    return _img_dims(ffprobe, path)[1]
+
+
+def _size_kb(path):
+    try:
+        return (os.path.getsize(path) + 1023) // 1024
+    except OSError:
+        return 0
+
+
+def compress_images(cfg, ctx=None):
+    """Compress one directory in place using the system ffmpeg / ffprobe.
+
+    Steps per image: backup original -> decode original once, scale tall
+    images by height -> encode to JPG at a quality mapped from the 1-100
+    setting -> step down quality (re-encoding from the ORIGINAL each time,
+    never from a previous lossy pass) until the size ceiling is met ->
+    atomic replace -> drop the original non-JPG file. Files already within
+    every limit are left untouched. Fully cancellable via ctx.
+    """
+    ctx = ctx or _LegacyFetchCtx()
+    setst, note = ctx.set, ctx.note
+    ffmpeg, ffprobe = compress_tools()
+    if not ffmpeg or not ffprobe:
+        _fetch_fail("未找到 ffmpeg（ffmpeg / ffprobe），无法压缩", ctx)
+        return
+
+    src = cfg["src_dir"]
+    backup = cfg["backup_dir"]
+    if not os.path.isdir(src):
+        _fetch_fail("源目录不存在或无权限：%s" % src, ctx)
+        return
+    if not os.access(src, os.R_OK | os.W_OK):
+        _fetch_fail("源目录不可读写：%s。请到 设置 → 应用管理 → RanPix → 权限设置 授权该目录" % src, ctx)
+        return
+    try:
+        os.makedirs(backup, exist_ok=True)
+    except OSError as exc:
+        _fetch_fail("无法创建备份目录 %s：%s" % (backup, exc), ctx)
+        return
+    if not os.access(backup, os.W_OK):
+        _fetch_fail("备份目录不可写：%s。请先在应用权限设置里授权" % backup, ctx)
+        return
+
+    max_h = cfg["max_height"]
+    max_kb = cfg["max_size_mb"] * 1024 if cfg["max_size_mb"] else 0
+    qs_best = _imq_to_qscale(cfg["q_max"])    # higher quality -> smaller qscale
+    qs_worst = _imq_to_qscale(cfg["q_min"])   # quality floor -> larger qscale
+    if qs_best > qs_worst:
+        qs_best, qs_worst = qs_worst, qs_best
+    to_jpg = bool(cfg["to_jpg"])
+    tmpdir = os.path.join(src, ".image_compress_tmp")
+    try:
+        os.makedirs(tmpdir, exist_ok=True)
+    except OSError as exc:
+        _fetch_fail("无法创建临时目录：%s" % exc, ctx)
+        return
+
+    # Gather candidate files (this directory, optionally recursive).
+    files = []
+    try:
+        if cfg["recursive"]:
+            for root, _dirs, names in os.walk(src):
+                if os.path.abspath(root).startswith(os.path.abspath(tmpdir)):
+                    continue
+                for n in names:
+                    p = os.path.join(root, n)
+                    if os.path.splitext(n)[1].lower() in COMPRESS_FORMATS:
+                        files.append(p)
+        else:
+            with os.scandir(src) as it:
+                for e in it:
+                    if e.is_file() and os.path.splitext(e.name)[1].lower() in COMPRESS_FORMATS:
+                        files.append(e.path)
+    except OSError as exc:
+        _fetch_fail("扫描目录失败：%s" % exc, ctx)
+        return
+    files.sort()
+    setst(target=src, done=0, total=len(files), page=0, error="")
+    note("开始压缩：%s（共 %d 张候选，短边≤%s，体积≤%s，编码 ffmpeg）"
+         % (src, len(files), max_h or "不限", (str(cfg["max_size_mb"]) + "MB") if max_kb else "不限"))
+
+    done = 0
+    skipped = 0
+    failed = 0
+    saved_kb = 0
+    try:
+        for idx, path in enumerate(files):
+            if ctx.cancelled():
+                break
+            name = os.path.basename(path)
+            ext = os.path.splitext(name)[1].lower()
+            is_jpg = ext in (".jpg", ".jpeg")
+            if not is_jpg and not to_jpg:
+                skipped += 1
+                continue
+
+            width, height = _img_dims(ffprobe, path)
+            size_kb = _size_kb(path)
+            if not height or not width or not size_kb:
+                note("跳过无效图片：%s" % name)
+                skipped += 1
+                continue
+            short_edge = min(width, height)
+            need = (max_h and short_edge > max_h) or (max_kb and size_kb > max_kb) or (not is_jpg)
+            if not need:
+                skipped += 1
+                continue
+
+            note("处理 %d/%d：%s（%dx%d，%dKB，%s）" %
+                 (idx + 1, len(files), name, width, height, size_kb, ext.lstrip(".").upper()))
+            base = os.path.splitext(name)[0]
+            final = os.path.join(os.path.dirname(path), base + ".jpg")
+            if os.path.abspath(final) == os.path.abspath(path):
+                final = path
+            work = os.path.join(tmpdir, base + ".work.jpg")
+            try:
+                if os.path.exists(work):
+                    os.unlink(work)
+            except OSError:
+                pass
+
+            # 1) backup original (once, keeps original format & full detail)
+            bpath = os.path.join(backup, name)
+            if not os.path.exists(bpath):
+                try:
+                    shutil.copy2(path, bpath)
+                except OSError as exc:
+                    note("备份失败，跳过：%s（%s）" % (name, exc))
+                    failed += 1
+                    continue
+
+            # Scale by SHORT EDGE (the smaller of width/height) when it exceeds
+            # the ceiling. Pin that short edge to the ceiling and let ffmpeg
+            # derive the other side ("-2" keeps aspect ratio and rounds to an
+            # even number, required by JPEG yuv420p).
+            vf = None
+            if max_h and short_edge > max_h:
+                edge = (max_h // 2) * 2 or 2
+                if height <= width:          # landscape: height is the short edge
+                    vf = "scale=-2:%d" % edge
+                else:                        # portrait: width is the short edge
+                    vf = "scale=%d:-2" % edge
+
+            def encode(qscale):
+                # Always decode from the ORIGINAL file so repeated passes never
+                # stack lossy re-encoding artifacts on top of each other.
+                argv = _ffmpeg_decode_argv(ffmpeg, path)
+                if vf:
+                    argv += ["-vf", vf]
+                argv += ["-q:v", str(qscale), work]
+                return _run_tool(argv, timeout=180)
+
+            # 2) first encode at the best mapped quality
+            ok, err = encode(qs_best)
+            if not ok or not _size_kb(work):
+                note("编码 JPG 失败，跳过：%s（%s）" % (name, (err or "")[:60]))
+                failed += 1
+                continue
+
+            # 3) step down quality while the file is still over the size cap
+            if max_kb:
+                q = qs_best
+                while _size_kb(work) > max_kb and q < qs_worst:
+                    q += 1
+                    ok2, err2 = encode(q)
+                    if not ok2 or not _size_kb(work):
+                        break
+
+            new_kb = _size_kb(work)
+            if not new_kb:
+                note("压缩结果无效，跳过：%s" % name)
+                failed += 1
+                continue
+            try:
+                os.replace(work, final)
+            except OSError as exc:
+                note("替换失败，跳过：%s（%s）" % (name, exc))
+                failed += 1
+                continue
+            # 4) drop the original non-JPG file after a successful replace
+            if not is_jpg and os.path.abspath(final) != os.path.abspath(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            if new_kb < size_kb:
+                saved_kb += size_kb - new_kb
+            done += 1
+            setst(done=done)
+            nw, nh = _img_dims(ffprobe, final)
+            note("完成：%s → %dx%d，%dKB（原 %dKB）" %
+                 (os.path.basename(final), nw, nh, new_kb, size_kb))
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except OSError:
+            pass
+        cancelled = ctx.cancelled()
+        setst(running=False, finished=time.time(),
+              phase="cancelled" if cancelled else "done",
+              error="" if (done or cancelled or skipped) else "没有需要处理的文件")
+        note("压缩结束：处理 %d 张，跳过 %d 张，失败 %d 张，共省 %.1f MB%s"
+             % (done, skipped, failed, saved_kb / 1024.0, "（已取消）" if cancelled else ""))
+
+
+# ---------------------------------------------------------------------------
+# Scheduled collection tasks (task mode). All task definitions live in one
+# JSON file; a single worker executes queued jobs serially so wallhaven is
+# never hammered by overlapping requests. Zero third-party dependencies.
+# ---------------------------------------------------------------------------
+TASKS_PATH = os.path.join(ETC_DIR, "tasks.json")
+_tasks_lock = threading.RLock()
+_tasks = []                       # list of persisted task dicts
+_task_rt = {}                     # task id -> runtime dict
+_task_queue = queue.Queue()
+_sched_stop = threading.Event()
+_queued_today = set()              # (task id, YYYY-MM-DD) claimed by scheduler
+
+
+def valid_time(value):
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(value or ""))
+    if not m:
+        return ""
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return ""
+    return "%02d:%02d" % (h, mi)
+
+
+def new_task_id():
+    return "t%d%03d" % (int(time.time()), random.randint(0, 999))
+
+
+def task_rt(tid):
+    with _tasks_lock:
+        rt = _task_rt.get(tid)
+        if rt is None:
+            rt = {"running": False, "phase": "idle", "done": 0, "total": 0,
+                  "page": 0, "log": [], "finished": 0, "started": 0,
+                  "error": "", "target": "", "cancel": threading.Event()}
+            _task_rt[tid] = rt
+        return rt
+
+
+def valid_days(value):
+    """Weekday set: 1=Mon ... 7=Sun. Empty string means one-shot."""
+    raw = str(value or "")
+    return "".join(d for d in "1234567" if d in raw)
+
+
+def load_tasks():
+    global _tasks
+    loaded = []
+    try:
+        with open(TASKS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        items = data.get("tasks") if isinstance(data, dict) else data
+        if isinstance(items, list):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                kind = str(it.get("type") or "fetch").strip()
+                if kind not in ("fetch", "compress"):
+                    kind = "fetch"           # legacy tasks have no type field
+                if kind == "compress":
+                    cfg, err = compress_valid(it.get("cfg") or {})
+                else:
+                    cfg, err = fetch_valid(it.get("cfg") or {})
+                    if not err:
+                        cfg = apply_global_key(cfg)
+                if err:
+                    continue
+                tid = str(it.get("id") or "").strip() or new_task_id()
+                try:
+                    cnt = int(it.get("last_count") or 0)
+                except (TypeError, ValueError):
+                    cnt = 0
+                # Migrate v1.3 tasks: loop=True -> every day, loop=False -> once.
+                days = it.get("days")
+                if days is None:
+                    days = "1234567" if it.get("loop", True) else ""
+                loaded.append({
+                    "id": tid,
+                    "type": kind,
+                    "name": str(it.get("name") or "未命名任务").strip()[:60] or "未命名任务",
+                    "enabled": bool(it.get("enabled", True)),
+                    "time": valid_time(it.get("time")) or "03:00",
+                    "days": valid_days(days),
+                    "last_run": str(it.get("last_run") or ""),
+                    "last_status": str(it.get("last_status") or "idle"),
+                    "last_count": cnt,
+                    "cfg": cfg,
+                })
+    except (OSError, ValueError):
+        pass
+    with _tasks_lock:
+        _tasks = loaded
+        for t in _tasks:
+            task_rt(t["id"])
+
+
+def save_tasks():
+    with _tasks_lock:
+        payload = {"tasks": [dict(t) for t in _tasks]}
+    tmp = TASKS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, TASKS_PATH)
+    try:
+        os.chmod(TASKS_PATH, 0o600)   # may contain an API key
+    except OSError:
+        pass
+
+
+def task_public(t, rt=None):
+    rt = rt or task_rt(t["id"])
+    cfg = t["cfg"]
+    kind = t.get("type", "fetch")
+    if kind == "compress":
+        pub_cfg = {k: cfg.get(k, v) for k, v in COMPRESS_DEFAULTS.items()}
+        target, count = cfg["src_dir"], 0
+    else:
+        # Full filter config for the edit form; never echo back the API key.
+        pub_cfg = {k: cfg.get(k, v) for k, v in FETCH_DEFAULTS.items() if k != "api_key"}
+        target, count = cfg["target"], cfg["count"]
+    return {
+        "id": t["id"], "type": kind, "name": t["name"], "enabled": t["enabled"],
+        "time": t["time"], "days": t.get("days", ""),
+        "loop": bool(t.get("days", "")),   # kept for older clients
+        "last_run": t["last_run"], "last_status": t["last_status"],
+        "last_count": t["last_count"],
+        "cfg": pub_cfg,
+        "target": target, "count": count,
+        "running": rt["running"], "phase": rt["phase"],
+        "done": rt["done"], "total": rt["total"], "page": rt["page"],
+        "error": rt["error"], "finished": rt["finished"],
+        "log": list(rt["log"]),
+    }
+
+
+class _TaskFetchCtx:
+    """wh_collect context bound to one task's runtime state."""
+    def __init__(self, tid):
+        self.tid = tid
+        self.rt = task_rt(tid)
+
+    def set(self, **kw):
+        with _tasks_lock:
+            self.rt.update(kw)
+
+    def note(self, text):
+        with _tasks_lock:
+            lines = self.rt["log"]
+            lines.append(text)
+            if len(lines) > 80:
+                del lines[:len(lines) - 80]
+        log("task[%s] %s" % (self.tid, text))
+
+    def cancelled(self):
+        return self.rt["cancel"].is_set()
+
+    def wait(self, sec):
+        return self.rt["cancel"].wait(sec)
+
+
+def run_task_job(tid):
+    """Execute one task in the single worker thread."""
+    with _tasks_lock:
+        t = next((x for x in _tasks if x["id"] == tid), None)
+    if not t:
+        return
+    rt = task_rt(tid)
+    kind = t.get("type", "fetch")
+    cfg = t["cfg"]
+    if kind == "compress":
+        target0, total0 = cfg["src_dir"], 0   # totals filled after directory scan
+    else:
+        target0, total0 = cfg["target"], cfg["count"]
+    with _tasks_lock:
+        rt["cancel"].clear()
+        rt.update(running=True, phase="running", done=0,
+                  total=total0, page=0, error="",
+                  started=time.time(), finished=0, target=target0, log=[])
+    ctx = _TaskFetchCtx(tid)
+    ctx.note("开始执行任务：%s（%s）" % (t["name"], t["time"]))
+    try:
+        if kind == "compress":
+            compress_images(dict(cfg), ctx)
+            _cache["ts"] = 0.0            # compressed files changed -> refresh APIs
+        else:
+            run_cfg = apply_global_key(dict(cfg))
+            if not run_cfg["api_key"] and run_cfg["purity"] != "100":
+                ctx.note("未填写 API Key，按规则强制仅下载 SFW")
+            wh_collect(run_cfg, ctx)
+    except Exception as exc:
+        log("task[%s] unexpected error: %s" % (tid, exc))
+        _fetch_fail("任务异常：%s" % exc, ctx)
+    finally:
+        phase = rt["phase"]
+        if phase == "cancelled":
+            status = "cancelled"
+        elif phase == "error":
+            status = "error"
+        elif rt["done"]:
+            status = "done"
+        else:
+            status = "empty"
+        with _tasks_lock:
+            t["last_run"] = time.strftime("%Y-%m-%d %H:%M")
+            t["last_status"] = status
+            t["last_count"] = rt["done"]
+            if not t.get("days"):
+                t["enabled"] = False          # one-shot: auto-disable after first run
+            rt["running"] = False
+        _cache["ts"] = 0.0
+        save_tasks()
+
+
+def _task_worker():
+    while True:
+        tid = _task_queue.get()
+        try:
+            run_task_job(tid)
+        except Exception as exc:
+            log("task worker error: %s" % exc)
+        finally:
+            _task_queue.task_done()
+
+
+def _scheduler_loop():
+    log("task scheduler started (weekday fixed-time, 20s tick)")
+    while not _sched_stop.wait(20):
+        try:
+            now = time.localtime()
+            hhmm = "%02d:%02d" % (now.tm_hour, now.tm_min)
+            today = time.strftime("%Y-%m-%d")
+            wd = str(now.tm_wday + 1)           # time.localtime: 0=Mon .. 6=Sun
+            with _tasks_lock:
+                due = []
+                for t in _tasks:
+                    if not t["enabled"]:
+                        continue
+                    if t["last_run"].startswith(today):
+                        continue
+                    if hhmm != t["time"]:        # only fire during the scheduled minute
+                        continue
+                    days = t.get("days", "")
+                    if days and wd not in days:  # empty days = one-shot, any day
+                        continue
+                    key = (t["id"], today)
+                    if key in _queued_today:
+                        continue
+                    _queued_today.add(key)
+                    due.append(t["id"])
+            for tid in due:
+                _task_queue.put(tid)
+                log("scheduler: queued task %s" % tid)
+        except Exception as exc:
+            log("scheduler error: %s" % exc)
+
+
+def start_tasks():
+    load_tasks()
+    threading.Thread(target=_task_worker, daemon=True).start()
+    threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
+
 PAGE = Template("""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>$title · 随机图片 API</title><style>
-:root{color-scheme:light}*{box-sizing:border-box}
+:root{color-scheme:light;
+--brand:#4a63d8;--ink:#1f2328;--muted:#656d76;--line:#e3e6ea;
+--c-run:#2f7de1;--c-set:#0f9b8e;--c-api:#7a5af0;--c-wall:#e0703a;--c-zip:#2f9e66;--c-help:#8a94a3}
+*{box-sizing:border-box}
 html,body{max-width:100%;overflow-x:hidden;overscroll-behavior-x:none}
-body{margin:0;background:#f5f7fa;color:#1f2328;-webkit-text-size-adjust:100%;touch-action:pan-y;
+body{margin:0;background:linear-gradient(180deg,#eaf0fb 0,#f5f7fa 260px,#f5f7fa 100%);
+color:var(--ink);-webkit-text-size-adjust:100%;touch-action:pan-y;
 font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
-.wrap{max-width:920px;margin:32px auto 60px;padding:0 20px}
-.head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:6px;min-width:0}
-.head img{width:40px;height:40px;border-radius:10px;flex:none}
-h1{font-size:21px;font-weight:600;margin:0;min-width:0;overflow-wrap:anywhere}
-p.sub{color:#656d76;margin:0 0 22px;overflow-wrap:anywhere}
-.card{background:#fff;border:1px solid #e3e6ea;border-radius:12px;padding:18px 20px;margin-bottom:16px;min-width:0}
-.card h2{font-size:15px;font-weight:600;margin:0 0 14px}
+.wrap{max-width:920px;margin:26px auto 56px;padding:0 20px}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;min-width:0;
+background:linear-gradient(120deg,#4a63d8,#6a7ce8);border-radius:14px;padding:14px 18px;
+box-shadow:0 6px 18px rgba(74,99,216,.24)}
+.head img{width:44px;height:44px;border-radius:11px;flex:none}
+h1{font-size:20px;font-weight:650;color:#fff;margin:0;min-width:0;overflow-wrap:anywhere}
+.head .badge{background:rgba(255,255,255,.22);color:#fff;font-weight:500}
+p.sub{color:var(--muted);margin:12px 2px 20px;overflow-wrap:anywhere;font-size:13.5px}
+.card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
+padding:18px 20px 18px 22px;margin-bottom:16px;min-width:0;
+box-shadow:0 2px 10px rgba(31,35,40,.05)}
+.card::before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:4px;
+background:var(--accent,#c9d0da);border-radius:12px 0 0 12px}
+.card h2{font-size:15px;font-weight:600;margin:0 0 14px;display:flex;align-items:center;gap:9px}
+.card h2::before{content:"";width:7px;height:15px;border-radius:3px;background:var(--accent,#c9d0da);flex:none}
+.c-run{--accent:var(--c-run)}.c-set{--accent:var(--c-set)}.c-api{--accent:var(--c-api)}
+.c-wall{--accent:var(--c-wall)}.c-zip{--accent:var(--c-zip)}.c-help{--accent:var(--c-help)}
+/* 使用说明默认收起，点击标题展开；标题外观与其他卡片标题一致 */
+.help-summary{list-style:none;cursor:pointer;font-size:15px;font-weight:600;
+display:flex;align-items:center;gap:8px;min-height:24px}
+.help-summary::after{content:"";width:7px;height:15px;border-radius:3px;background:var(--accent,#c9d0da);order:-1}
+.help-summary::-webkit-details-marker{display:none}
+.help-summary::before{content:'▸';font-size:13px;color:#656d76;flex:none;transition:transform .15s}
+#helpbox[open]>.help-summary::before{transform:rotate(90deg)}
+.help-body{padding:12px 0 0}
 code{background:#f1f3f5;padding:2px 6px;border-radius:5px;font-size:12.5px;
 word-break:break-all;overflow-wrap:anywhere}
 a{color:#185fa5;text-decoration:none;overflow-wrap:anywhere}
-input[type=text],input[type=number]{border:1px solid #d5d9de;border-radius:6px;
-padding:7px 10px;font:inherit;width:100%;min-width:0;background:#fff;color:#1f2328}
+/* 16px 是关键：iOS/WebView 聚焦小于 16px 的输入框会自动放大页面 */
+input,select,textarea{border:1px solid #d5d9de;border-radius:6px;
+padding:7px 10px;font:inherit;font-size:16px;width:100%;min-width:0;
+background:#fff;color:#1f2328;-webkit-appearance:none;appearance:none}
 label{display:block;font-size:13px;color:#656d76;margin-bottom:5px}
 .grid{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
 .grid>div{min-width:0;flex:1 1 210px}
 .grid>div.sm{flex:0 1 170px}
 .grid>div.grow{flex:1 1 260px}
-.stats{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px 20px}
-.stat{min-width:0}
-.stat .k{font-size:12.5px;color:#656d76}
-.stat .v{margin-top:1px;min-width:0;overflow-wrap:anywhere}
-.apis{border-top:1px solid #eef0f2}
+.eqrow>div{flex:1 1 0;min-width:0}
+.advrow{flex-wrap:nowrap}
+.advrow>div.grow{flex:1 1 260px}
+.advrow>div.eq{flex:1 1 0;min-width:0}
+.advrow label{position:relative;cursor:help}
+.advrow label .hint{display:none;position:absolute;left:0;top:100%;z-index:8;
+white-space:nowrap;background:#1f2328;color:#fff;font-size:12px;font-weight:400;
+padding:5px 8px;border-radius:5px;box-shadow:0 3px 10px rgba(0,0,0,.18)}
+.advrow label:hover .hint{display:block}
+.stats{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 12px}
+.stat{min-width:0;background:#f7f9fc;border:1px solid #eef1f5;border-radius:9px;padding:10px 12px}
+.stat .k{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.stat .k::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--c-run);flex:none}
+.stat .v{margin-top:3px;min-width:0;overflow-wrap:anywhere;font-weight:600;font-size:13.5px}
+.apis{display:flex;flex-direction:column;gap:8px}
 .api{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;
-padding:10px 0;border-bottom:1px solid #eef0f2;min-width:0}
-.api:last-child{border-bottom:none}
+padding:11px 13px;border:1px solid #eef1f5;border-radius:9px;background:#fbfcfe;
+min-width:0;transition:border-color .15s,background .15s}
+.api:hover{border-color:#d9e0ea;background:#f8fafd}
 .api .name{min-width:0;flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;
 white-space:nowrap}
 .api .num{flex:none;color:#656d76;font-size:13px;white-space:nowrap}
@@ -363,19 +1499,95 @@ white-space:nowrap}
 .api .acts a{display:inline-flex;align-items:center;min-height:38px;
 font:inherit;line-height:1.2;white-space:nowrap}
 .api .acts button{min-height:38px;line-height:1.2}
+.api .tacts{flex:1 1 100%;flex-wrap:wrap}
+.api .tacts button{flex:0 1 auto}
 .api .note{flex:1 1 100%;font-size:12.5px;overflow-wrap:anywhere}
 .cpbox{flex:1 1 100%;-webkit-user-select:text;user-select:text}
 button{border:1px solid #d5d9de;background:#fff;border-radius:6px;padding:7px 12px;
 cursor:pointer;font:inherit;color:#1f2328;white-space:nowrap;max-width:100%}
 button.primary{background:#4a63d8;border-color:#4a63d8;color:#fff;font-weight:500}
 button.primary:hover{background:#3d54c0}
+button.danger{color:#b42318;border-color:#f3c3bd;background:#fff5f4}
+button.danger:hover{background:#ffe9e6;border-color:#e8a49b}
 button:hover{border-color:#9aa4b2}
 .meta{color:#656d76;font-size:13px;margin:6px 0 0;overflow-wrap:anywhere}
 .ok{color:#1a7f37}.warn{color:#b42318}
 #msg{margin-top:12px;font-size:13px;min-height:18px;overflow-wrap:anywhere}
+.cfgmsg{display:none;margin-top:10px;padding:9px 12px;border-radius:8px;font-size:13px;line-height:1.5;overflow-wrap:anywhere}
+.cfgmsg.show{display:block}
+.cfgmsg.warn{background:#fff1f0;border:1px solid #ffccc7;color:#b42318}
+.cfgmsg.ok{background:#eefbf3;border:1px solid #b7ebc8;color:#1a7f37}
 .kv{color:#656d76;font-size:13px;overflow-wrap:anywhere}
 .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;
 background:#eef1f6;color:#4a5361}
+.fbar{height:8px;background:#eef1f6;border-radius:6px;overflow:hidden;margin:12px 0 8px}
+.fbar>i{display:block;height:100%;width:0;background:#4a63d8;transition:width .3s}
+.flog{max-height:170px;overflow:auto;background:#f6f8fa;border:1px solid #eef0f2;
+border-radius:8px;padding:9px 11px;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;
+color:#4a5361;white-space:pre-wrap;word-break:break-all;margin-top:10px}
+.frow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px}
+.fstatus{font-size:13px;color:#656d76;min-width:0;overflow-wrap:anywhere}
+#tformbox>summary{color:var(--c-wall);font-weight:600}
+#tformbox[open]>summary{margin-bottom:14px}
+#tformbox{background:#fff;border:1px dashed #e6d5c4;border-radius:10px;padding:12px 14px}
+#zformbox>summary{color:var(--c-zip);font-weight:600}
+#zformbox[open]>summary{margin-bottom:14px}
+#zformbox{background:#fff;border:1px dashed #cfe6d8;border-radius:10px;padding:12px 14px}
+#zformbox .sec{color:#1c7a4d;background:#eafaf1}
+.zpath input{font-size:16px}
+/* Task editor: table-style sections with compact checkbox groups */
+.sec{font-size:12px;font-weight:700;color:#8a5a2b;letter-spacing:.02em;
+margin:16px 0 7px;padding:4px 9px;display:inline-block;
+background:#fff4ea;border-radius:6px}
+.sec:first-child{margin-top:0}
+.filterrow{display:flex;flex-wrap:wrap;gap:0 28px}
+.filterrow>div{flex:1 1 240px;min-width:0}
+.opts{display:flex;flex-wrap:wrap;gap:6px 14px}
+.opts label{display:inline-flex;align-items:center;gap:4px;margin:0;
+font-size:14px;color:#1f2328;white-space:nowrap}
+/* The global `input{appearance:none}` rule leaves native checkboxes blank in
+   the fnOS WebView, so they look unselectable. Draw our own box + tick: the
+   toggle itself is native, only the visual is ours, so it works everywhere. */
+.opts input[type=checkbox]{-webkit-appearance:none;appearance:none;
+width:17px;height:17px;flex:none;min-width:0;margin:0;padding:0;
+border:1.5px solid #c2c8d0;border-radius:4px;background-color:#fff;
+background-repeat:no-repeat;background-position:center;background-size:14px 14px;
+cursor:pointer;vertical-align:middle}
+.opts input[type=checkbox]:checked{background-color:#4a63d8;border-color:#4a63d8;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5l3 3 7-7' fill='none' stroke='%23fff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+.opts input[type=checkbox]:disabled{opacity:.4;cursor:not-allowed}
+.opts label.off{color:#a0a6ad}
+/* 循环模式：开始前清空 + 执行时刻 + 周几 三项同排、同高控件 */
+.sched{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:flex-end}
+.sched .sf{flex:1 1 0;min-width:0}
+.sched .sf.week{flex:2 1 0}   /* 周几按钮多，占两份以免折行 */
+.sched .sf>label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 清空项做成与输入框同高的勾选框，保持三项视觉一致 */
+.sched .clrbox{height:38px;box-sizing:border-box;align-items:center;padding:0 10px;
+border:1px solid #d5d9de;border-radius:6px;background:#fff}
+.sched .clrbox label{white-space:nowrap}
+#day_box,#z_day_box{gap:6px}
+#day_box label,#z_day_box label{position:relative;padding:0;border:0;background:none;
+height:38px;min-width:38px;justify-content:center}
+#day_box label span,#z_day_box label span{display:inline-flex;align-items:center;justify-content:center;
+height:38px;min-width:38px;padding:0 11px;box-sizing:border-box;
+border:1px solid #d5d9de;border-radius:7px;background:#fff;
+font-size:14px;color:#4a5361;transition:background .15s,border-color .15s,color .15s}
+#day_box label:hover span,#z_day_box label:hover span{border-color:#9aa4b2}
+#day_box input:checked+span{background:#4a63d8;border-color:#4a63d8;color:#fff}
+#z_day_box input:checked+span{background:var(--c-zip);border-color:var(--c-zip);color:#fff}
+#day_box input[type=checkbox],#z_day_box input[type=checkbox]{position:absolute;inset:0;width:100%;height:100%;
+margin:0;border:0;background:none;opacity:0;cursor:pointer;z-index:1}
+.apikeybox{border:1px solid #f0e0d0;border-radius:10px;
+padding:12px 14px;margin-bottom:14px;background:#fffaf5}
+.apikeybox .frow{margin-top:6px}
+.apikeybox input[type=password]{flex:1 1 240px}
+.badge.on{background:#eefbf3;color:#1a7f37}
+.badge.off{background:#fff1f0;color:#b42318}
+/* select 已并入上方 input,select,textarea 规则（16px 防聚焦放大），此处保留下拉箭头 */
+select{-webkit-appearance:none;appearance:none;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23656d76' fill='none'/%3E%3C/svg%3E");
+background-repeat:no-repeat;background-position:right 10px center;padding-right:28px}
 /* In-page preview: a new window is blocked by the fnOS App WebView, so show
    the image in a lightbox inside this iframe instead. */
 #pv{position:fixed;top:0;left:0;right:0;bottom:0;inset:0;z-index:9999;
@@ -399,6 +1611,10 @@ padding:10px 14px;border-top:1px solid #eef0f2}
  .card{padding:14px 14px}
  h1{font-size:19px}
  .grid>div,.grid>div.sm,.grid>div.grow{flex:1 1 100%}
+ .sched .sf,.sched .sf.week{flex:1 1 100%}
+ .advrow{flex-wrap:wrap}
+ .advrow>div.grow{flex:1 1 100%}
+ .advrow>div.eq{flex:1 1 45%}
  .stats{gap:10px 12px}
  .api{gap:6px 8px}
  .api .acts{gap:6px}
@@ -407,9 +1623,9 @@ padding:10px 14px;border-top:1px solid #eef0f2}
 }
 </style></head><body><div class="wrap">
 <div class="head"><img src="$base/_icon" alt=""><h1>$title <span class="badge">v$version</span></h1></div>
-<p class="sub">一个轻量的随机图片API 应用· 每个子文件夹就是一个独立随机图片接口</p>
+<p class="sub">一个轻量的随机图片API 应用，附带Wallhaven图片采集与图片压缩能力。</p>
 
-<div class="card"><h2>运行状态</h2><div class="stats">
+<div class="card c-run"><h2>运行状态</h2><div class="stats">
 <div class="stat"><div class="k">图片根目录</div><div class="v"><code>$root</code></div></div>
 <div class="stat"><div class="k">接口 / 图片</div><div class="v">$apicount 个接口 · $imgcount 张图片
 <span class="kv">（扫描缓存 $ttl 秒）</span></div></div>
@@ -417,21 +1633,153 @@ padding:10px 14px;border-top:1px solid #eef0f2}
 <div class="stat"><div class="k">目录状态</div><div class="v $stateclass">$state</div></div>
 </div></div>
 
-<div class="card"><h2>设置</h2>
+<div class="card c-set"><h2>设置</h2>
 <div class="grid">
 <div class="sm"><label for="f_port">服务端口</label><input id="f_port" type="number" min="1024" max="65535" value="$port"></div>
-<div class="grow"><label for="f_root">图片根目录（留空 = 自动使用已授权目录）</label>
+<div class="grow"><label for="f_root">图片根目录（留空=自动使用已授权目录）</label>
 <input id="f_root" type="text" value="$root_value" placeholder="留空即自动跟随应用权限中授权的文件夹"></div>
 <div class="sm"><label for="f_ttl">缓存秒数</label><input id="f_ttl" type="number" min="1" max="3600" value="$ttl"></div>
 </div>
 <div style="margin-top:14px"><button class="primary" id="save">保存并应用</button>
 <button id="reload" style="margin-left:8px">立即刷新</button></div>
-<p class="meta">桌面 / 手机入口走飞牛网关，改端口不影响图标；改图库路径即时生效。输入框显示的是当前生效路径；留空则自动使用应用权限里授权的文件夹，手动指定其它目录需先授权。「立即刷新」用于刚往图库加了图片、不想等缓存到期时清空清单缓存。</p>
+<div id="cfgmsg" class="cfgmsg"></div>
 <div id="msg"></div></div>
 
-<div class="card"><h2>接口列表</h2><div class="apis">$rows</div></div>
+<div class="card c-api"><h2>接口列表</h2><div class="apis">$rows</div></div>
 
-<div class="card"><h2>使用说明</h2>
+<div class="card c-wall"><h2>Wallhaven壁纸采集</h2>
+<div class="apikeybox">
+<label for="api_key">API Key（留空则仅下载 SFW）</label>
+<div class="frow"><input id="api_key" type="password" placeholder="留空并保存=清除 Key，仅下载 SFW">
+<button class="primary" id="keysave">保存 API Key</button>
+<span class="badge" id="keystate">检测中…</span></div>
+</div>
+<div id="tasklist"></div>
+<div class="frow"><button class="primary" id="tnew">+ 新建任务</button></div>
+<details id="tformbox" style="margin-top:14px"><summary style="cursor:pointer;font-size:13px;color:#656d76">任务参数与筛选条件</summary>
+<div class="grid eqrow">
+<div><label for="t_name">任务名称</label><input id="t_name" type="text" placeholder="例如 每日动漫壁纸"></div>
+<div><label for="t_target">目标分类（子文件夹名）</label><input id="t_target" type="text" value="Wallhaven"></div>
+<div><label for="t_count">每次下载张数</label><input id="t_count" type="number" min="1" max="200" value="24"></div>
+<div><label for="t_enabled">状态</label><select id="t_enabled"><option value="1">启用</option><option value="0">停用</option></select></div>
+</div>
+<div class="sec">循环模式</div>
+<div class="sched">
+<div class="sf clr"><label>开始前清空目标分类文件夹</label>
+<div class="opts clrbox"><label><input type="checkbox" id="t_clear"><span>清空后再采集</span></label></div></div>
+<div class="sf tm"><label for="t_time">执行时刻（HH:MM）</label><input id="t_time" type="text" value="03:00" placeholder="03:00"></div>
+<div class="sf week">
+<label>每周（全不选=单次）</label>
+<div class="opts" id="day_box">
+<label><input type="checkbox" id="day1" value="1"><span>一</span></label>
+<label><input type="checkbox" id="day2" value="2"><span>二</span></label>
+<label><input type="checkbox" id="day3" value="3"><span>三</span></label>
+<label><input type="checkbox" id="day4" value="4"><span>四</span></label>
+<label><input type="checkbox" id="day5" value="5"><span>五</span></label>
+<label><input type="checkbox" id="day6" value="6"><span>六</span></label>
+<label><input type="checkbox" id="day7" value="7"><span>日</span></label>
+</div>
+</div>
+</div>
+<div class="filterrow" style="margin-top:14px">
+<div>
+<div class="sec">壁纸类型</div>
+<div class="opts" id="cat_box">
+<label><input type="checkbox" id="cat0">通用</label>
+<label><input type="checkbox" id="cat1">动漫</label>
+<label><input type="checkbox" id="cat2">人物</label>
+</div>
+</div>
+<div>
+<div class="sec">纯净度</div>
+<div class="opts" id="pur_box">
+<label><input type="checkbox" id="pur0">SFW</label>
+<label id="pur1_l"><input type="checkbox" id="pur1">Sketchy</label>
+<label id="pur2_l"><input type="checkbox" id="pur2">NSFW</label>
+</div>
+</div>
+</div>
+<div class="filterrow" style="margin-top:14px">
+<div>
+<div class="sec">比例（全不选=不限）</div>
+<div class="opts" id="ratio_box">
+<label><input type="checkbox" value="landscape">横屏</label>
+<label><input type="checkbox" value="portrait">竖屏</label>
+<label><input type="checkbox" value="1x1">正方形</label>
+</div>
+</div>
+<div>
+<div class="sec">排序（单选）</div>
+<div class="opts" id="sort_box">
+<label><input type="checkbox" value="hot">热门</label>
+<label><input type="checkbox" value="toplist">最近一周</label>
+<label><input type="checkbox" value="favorites">收藏量</label>
+<label><input type="checkbox" value="views">浏览量</label>
+</div>
+</div>
+</div>
+<div class="sec">高级筛选</div>
+<div class="grid advrow">
+<div class="eq"><label for="t_start">起始页码<span class="hint">0=随机</span></label><input id="t_start" type="number" min="0" max="500" value="0"></div>
+<div class="eq"><label for="t_end">结束页码<span class="hint">0=不限</span></label><input id="t_end" type="number" min="0" max="500" value="0"></div>
+<div class="eq"><label for="t_short">尺寸限制<span class="hint">短边≥px，0=不限</span></label><input id="t_short" type="number" min="0" max="10000" value="0"></div>
+<div class="eq"><label for="t_minfav">最小收藏数<span class="hint">0=不限</span></label><input id="t_minfav" type="number" min="0" value="0"></div>
+<div class="eq"><label for="t_minsize">最小体积 KB<span class="hint">0=不限</span></label><input id="t_minsize" type="number" min="0" value="0"></div>
+<div class="eq"><label for="t_maxsize">最大体积 MB<span class="hint">0=不限</span></label><input id="t_maxsize" type="number" min="0" value="0"></div>
+</div>
+<div class="frow"><button class="primary" id="tsave">保存任务</button><button id="tcancel">取消</button></div>
+<p class="meta" id="tformmsg"></p>
+</details>
+<div class="cfgmsg" id="tmsg"></div>
+<div class="flog" id="tlog" style="display:none"></div>
+</div>
+
+<div class="card c-zip"><h2>图片压缩</h2>
+<p class="meta">把目录里的图片转为 JPG、限制高度与体积，原图自动备份。使用系统自带的 ffmpeg。</p>
+<div id="zlist"></div>
+<div class="frow"><button class="primary" id="znew">+ 新建压缩任务</button></div>
+<details id="zformbox" style="margin-top:14px"><summary style="cursor:pointer;font-size:13px;color:#656d76">压缩任务参数</summary>
+<div class="grid eqrow">
+<div><label for="z_name">任务名称</label><input id="z_name" type="text" placeholder="例如 每日压缩壁纸"></div>
+<div class="zpath"><label for="z_src">源目录</label><input id="z_src" type="text" value="/vol2/1000/Media/Wallhaven" placeholder="绝对路径"></div>
+<div class="zpath"><label for="z_backup">备份目录</label><input id="z_backup" type="text" value="/vol2/1000/Media/Image/Wall-Backup" placeholder="绝对路径"></div>
+<div><label for="z_enabled">状态</label><select id="z_enabled"><option value="1">启用</option><option value="0">停用</option></select></div>
+</div>
+<div class="sec">压缩规则</div>
+<div class="grid advrow">
+<div class="eq"><label for="z_height">短边最大PX<span class="hint">0=不限，宽高较小一边</span></label><input id="z_height" type="number" min="0" max="20000" value="2160"></div>
+<div class="eq"><label for="z_size">最大体积 MB<span class="hint">0=不限</span></label><input id="z_size" type="number" min="0" max="2000" value="5"></div>
+<div class="eq"><label for="z_qmax">质量上限<span class="hint">98=高保真</span></label><input id="z_qmax" type="number" min="1" max="100" value="98"></div>
+<div class="eq"><label for="z_qmin">质量下限<span class="hint">底线</span></label><input id="z_qmin" type="number" min="1" max="100" value="85"></div>
+</div>
+<div class="opts" style="margin-top:12px">
+<label><input type="checkbox" id="z_tojpg" checked>非 JPG 转 JPG</label>
+<label><input type="checkbox" id="z_rec">包含子目录</label>
+</div>
+<div class="sec">循环模式</div>
+<div class="sched">
+<div class="sf tm"><label for="z_time">执行时刻（HH:MM）</label><input id="z_time" type="text" value="03:00" placeholder="03:00"></div>
+<div class="sf week">
+<label>每周（全不选=单次）</label>
+<div class="opts" id="z_day_box">
+<label><input type="checkbox" id="zday1" value="1"><span>一</span></label>
+<label><input type="checkbox" id="zday2" value="2"><span>二</span></label>
+<label><input type="checkbox" id="zday3" value="3"><span>三</span></label>
+<label><input type="checkbox" id="zday4" value="4"><span>四</span></label>
+<label><input type="checkbox" id="zday5" value="5"><span>五</span></label>
+<label><input type="checkbox" id="zday6" value="6"><span>六</span></label>
+<label><input type="checkbox" id="zday7" value="7"><span>日</span></label>
+</div>
+</div>
+</div>
+<div class="frow"><button class="primary" id="zsave">保存任务</button><button id="zcancel">取消</button></div>
+<p class="meta" id="zformmsg"></p>
+</details>
+<div class="cfgmsg" id="zmsg"></div>
+<div class="flog" id="zlog" style="display:none"></div>
+</div>
+
+<div class="card c-help"><details id="helpbox"><summary class="help-summary">使用说明</summary><div class="help-body">
 <p class="meta">目录结构：<code>图片根目录/分类名/*.jpg</code>，支持 jpg / jpeg / png / webp / gif / bmp / tiff，子目录可再嵌套。</p>
 <p class="meta">新增接口：在图库里新建一个子文件夹并放入图片，最多等 $ttl 秒自动生效，无需重启。</p>
 <p class="meta"><b>缓存秒数</b>（当前 $ttl 秒，可设 1–3600）：服务把「图库扫描结果（各分类的图片清单）」
@@ -443,15 +1791,30 @@ padding:10px 14px;border-top:1px solid #eef0f2}
 <b>设置 → 应用管理 → RanPix → 权限设置</b> 授权；该列表只有共享文件夹，<b>选不到子目录</b>。
 子文件夹显示「目录无读取权限」时，到 <b>文件管理 → 选中文件夹 → 详细信息 → 权限 → 高级</b>
 启用继承父级权限（或在父目录上「重置子级权限」）。根目录能读不代表每个子目录都能读。</p>
-<p class="meta">「打开看看」在当前页弹出预览；「复制地址」会<b>跟随当前访问的域名 / IP</b>，端口固定为免登录的服务端口 <code>$port</code>，
+<p class="meta">「打开看看」在当前页预览，按<b>下载时间由近到远</b>逐张浏览（上一张 / 下一张）；点「删除」移除该图并加入<b>全局黑名单</b>，此后所有采集任务扫到都会跳过。「复制地址」始终给出<b>随机</b>接口，并<b>跟随当前访问的域名 / IP</b>，端口固定为免登录的服务端口 <code>$port</code>，
 因此复制结果可粘贴到任意浏览器或第三方应用（中文接口名自动编码）；从网关入口复制时会自动把端口换成服务端口。</p>
 <p class="meta">注意：<code>$gwurl</code> 是飞牛同源网关地址，只在已登录的桌面 / 手机 App 内有效；
 直接外传会被飞牛统一鉴权拦截，显示 <code>invalid token</code>，所以「复制地址」不会给出这种地址。</p>
+<p class="meta"><b>采集任务</b>：按界面各项配置。
+<b>循环模式</b>勾选每周一到周日中的一天或多天，在这些天的设定时刻执行；<b>全不选</b>即单次任务，
+第一次跑完自动停用。<b>下载顺序</b>：图片按接口返回顺序逐张下载，不打乱；起始页码填 0=只随机一次起始页，
+填具体数字=从该页第一张开始；之后都按页码顺序往后翻。结束页码填 0=不限（仍受 API 总页数限制）。
+<b>尺寸限制（短边≥px）</b>转换为 Wallhaven 的 <code>atleast=PxP</code>，即宽和高都不小于该值。
+排序支持热门、最近一周、收藏量、浏览量；壁纸类型与纯净度可多选，
+比例可多选（全不选为不限）。多个任务串行执行，可随时「立即运行」或「停止」，状态每 3 秒刷新。
+已下载的壁纸 ID 记在对应目录下的 <code>downloaded.txt</code>，不会重复下载；原图 CDN 不可达时自动回退高清缩略图。
+<b>API Key 留空时即使勾选了 Sketchy / NSFW 也会强制仅下载 SFW</b>；采集目录需允许应用用户写入。</p>
+<p class="meta"><b>图片压缩任务</b>：把「源目录」里的 jpg / png / bmp / tiff 图片转为 JPG，短边（宽高较小一边）超过上限按比例缩小，
+体积超过上限时逐步降低质量（下限保护细节，每次均从原图重新编码避免反复压缩）；已达标的图跳过。原图按原名备份到「备份目录」（仅一次），
+处理成功后原子替换、删掉原格式文件。<b>源目录与备份目录都要在 设置 → 应用管理 → RanPix → 权限设置 里授权</b>，
+且应用用户对两者可读写。默认路径来自原 compress.sh；使用飞牛系统自带的 ffmpeg（ffmpeg / ffprobe），无需额外安装。
+调度方式（定时/周几/单次、立即运行/停止、日志）与采集任务一致，多个任务串行执行。</p>
 <p class="meta">接口列表 <a href="$base/_apis">/_apis</a> · 健康检查 <a href="$base/_health">/_health</a> ·
 响应带 <code>no-store</code>，浏览器和 CDN 不会缓存，每次请求都是新的一张。</p>
-</div></div>
+</div></details></div>
 <script>
 var BASE='$base', GATEWAY=$gateway, DIRECT='$direct', PORT=$port;
+var TDEF=$tdef, CDEF=$cdef;
 function msg(t,c){var e=document.getElementById('msg');e.textContent=t;e.className=c||'';}
 function gwUrl(p){return location.protocol+'//'+location.host+BASE+'/'+p;}
 /* Shareable URL: follow whatever host the user is currently visiting, but
@@ -470,40 +1833,60 @@ function directUrl(p){
    blocks target=_blank, so show the image in a lightbox inside this page.
    Gateway URL is tried first (same-origin, carries the App session); if it
    is rejected, fall back to the token-free LAN URL. */
-var pvEl=null,pvP='',pvStage=0,pvSeq=0;
+var pvEl=null,pvP='',pvStage=0,pvSeq=0,pvIdx=0,pvTotal=0;
 function pvClose(){if(pvEl&&pvEl.parentNode){pvEl.parentNode.removeChild(pvEl)}pvEl=null;}
 function pvLoad(){
   var img=document.getElementById('pvImg'),err=document.getElementById('pvErr');
   pvStage=0;err.style.display='none';img.style.display='';
   pvSeq++;
-  img.src=gwUrl(pvP)+'?_='+Date.now()+'-'+pvSeq;
-  document.getElementById('pvUrl').textContent=directUrl(pvP);
+  /* 预览按下载时间由近到远顺序浏览；复制链接始终是不带参数的随机接口 */
+  var q='order=recent&i='+pvIdx+'&_='+Date.now()+'-'+pvSeq;
+  img.src=gwUrl(pvP)+'?'+q;
+  var n=document.getElementById('pvIdx');
+  if(n){var shown=pvTotal?(pvIdx%pvTotal)+1:pvIdx+1;n.textContent='第 '+shown+' / '+(pvTotal||'?')+' 张';}
 }
 function pvFail(){
   var img=document.getElementById('pvImg'),err=document.getElementById('pvErr');
-  if(pvStage===0){pvStage=1;img.src=directUrl(pvP)+'?_='+Date.now()+'-'+pvSeq;return;}
+  if(pvStage===0){pvStage=1;img.src=directUrl(pvP)+'?order=recent&i='+pvIdx+'&_='+Date.now()+'-'+pvSeq;return;}
   img.style.display='none';err.style.display='block';
   err.textContent='图片加载失败。请在与 NAS 同一网络的浏览器中打开这个直连地址：'+directUrl(pvP);
 }
-function pvShow(p){
-  pvP=p;
+function pvShow(p,n){
+  pvP=p;pvIdx=0;pvTotal=n||0;
   if(!pvEl){
     pvEl=document.createElement('div');pvEl.id='pv';
     pvEl.innerHTML='<div class="card"><div class="bar"><span id="pvTitle"></span>'+
       '<button id="pvX" type="button">关闭</button></div>'+
       '<div class="body"><img id="pvImg" alt=""><div id="pvErr" class="err" style="display:none"></div></div>'+
-      '<div class="foot"><button id="pvNext" type="button">换一张</button>'+
-      '<button id="pvCopy" class="cp" type="button">复制直连地址</button>'+
-      '<div class="u" id="pvUrl"></div></div></div>';
+      '<div class="foot"><button id="pvPrev" type="button">上一张</button>'+
+      '<button id="pvNext" type="button">下一张</button><span id="pvIdx" class="badge"></span>'+
+      '<button id="pvDel" class="danger" type="button">删除</button></div></div>';
     document.body.appendChild(pvEl);
     pvEl.addEventListener('click',function(e){if(e.target===pvEl)pvClose()});
     document.getElementById('pvX').onclick=pvClose;
-    document.getElementById('pvNext').onclick=function(){pvLoad()};
+    document.getElementById('pvPrev').onclick=function(){pvIdx=Math.max(0,pvIdx-1);pvLoad()};
+    document.getElementById('pvNext').onclick=function(){pvIdx++;pvLoad()};
+    document.getElementById('pvDel').onclick=function(){pvDelete()};
     document.getElementById('pvImg').onerror=function(){pvFail()};
   }
-  document.getElementById('pvTitle').textContent='/'+decodeURIComponent(p)+' · 随机一张';
-  document.getElementById('pvCopy').setAttribute('data-p',p);
+  document.getElementById('pvTitle').textContent='/'+decodeURIComponent(p)+' · 按下载时间浏览';
+  document.getElementById('pvDel').textContent='删除';
   pvLoad();
+}
+function pvDelete(){
+  var btn=document.getElementById('pvDel');if(!btn||btn.disabled)return;
+  if(!window.confirm('删除这张图片？'+String.fromCharCode(10)+'删除后会加入全局黑名单，以后任何采集任务扫到它都会自动跳过。'))return;
+  btn.disabled=true;
+  fetch(BASE+'/_image/delete',{method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'cat='+encodeURIComponent(pvP)+'&i='+pvIdx})
+   .then(function(r){return r.json()}).then(function(j){
+     btn.disabled=false;
+     if(!j.ok){btn.textContent='删除失败';msg('删除失败：'+(j.error||'未知错误'),'warn');return;}
+     btn.textContent=j.blacklisted?'已删除·已拉黑':'已删除';
+     if(pvTotal>0)pvTotal--;
+     pvLoad();
+   }).catch(function(e){btn.disabled=false;btn.textContent='删除失败';msg('请求失败：'+e,'warn')});
 }
 /* Copy buttons: delegated binding + clipboard API -> execCommand -> selectable box.
    The fnOS App embeds this page in an iframe where clipboard-write is often
@@ -546,22 +1929,25 @@ document.addEventListener('click',function(e){
       var p=b.getAttribute('data-p');
       if(p!==null&&p!==undefined){
         var cls=' '+(b.className||'')+' ';
-        if(b.tagName==='A'&&cls.indexOf(' pv ')>=0){e.preventDefault();pvShow(p);return;}
+        if(b.tagName==='A'&&cls.indexOf(' pv ')>=0){e.preventDefault();pvShow(p,parseInt(b.getAttribute('data-n'),10)||0);return;}
         if(b.tagName==='BUTTON'&&cls.indexOf(' cp ')>=0){copyUrl(b);return;}
       }
     }
     b=b.parentNode;
   }
 });
+function cfgMsg(t,c){var e=document.getElementById('cfgmsg');if(!e)return;e.textContent=t;e.className='cfgmsg show '+(c||'');}
 document.getElementById('save').onclick=function(){
-  var btn=this;btn.disabled=true;msg('正在保存…');
-  var body=new URLSearchParams({port:document.getElementById('f_port').value,
-    image_root:document.getElementById('f_root').value,
-    cache_ttl:document.getElementById('f_ttl').value});
+  var btn=this;btn.disabled=true;cfgMsg('正在保存…','');msg('正在保存…');
+  var enc=encodeURIComponent;
+  var body='port='+enc(document.getElementById('f_port').value)
+    +'&image_root='+enc(document.getElementById('f_root').value)
+    +'&cache_ttl='+enc(document.getElementById('f_ttl').value);
   fetch(BASE+'/_config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
    .then(function(r){return r.json()}).then(function(j){
      btn.disabled=false;
-     if(!j.ok){msg('保存失败：'+j.error,'warn');return;}
+     if(!j.ok){var t='保存失败：'+(j.error||'未知错误')+'（本次未保存任何设置）';cfgMsg(t,'warn');msg(t,'warn');return;}
+     cfgMsg('已保存并生效：图库 '+j.image_root+' · 缓存 '+j.cache_ttl+' 秒','ok');
      if(j.restart){
        msg('端口已改为 '+j.port+'，正在重启服务…','ok');
        if(GATEWAY){setTimeout(function(){location.reload()},1800);}
@@ -571,7 +1957,7 @@ document.getElementById('save').onclick=function(){
        msg('已保存，'+(j.message||'配置已生效'),'ok');
        setTimeout(function(){location.reload()},900);
      }
-   }).catch(function(e){btn.disabled=false;msg('请求失败：'+e,'warn')});
+   }).catch(function(e){btn.disabled=false;var t='请求失败：'+e;cfgMsg(t,'warn');msg(t,'warn')});
 };
 document.getElementById('reload').onclick=function(){
   var btn=this;btn.disabled=true;msg('正在重新扫描图库…');
@@ -583,6 +1969,336 @@ document.getElementById('reload').onclick=function(){
      setTimeout(function(){location.reload()},900);
    }).catch(function(e){btn.disabled=false;msg('请求失败：'+e,'warn')});
 };
+/* ---- Wallhaven collector (stage 1) ---- */
+function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function tpost(path,extra,cb){
+  var p=[];
+  for(var k in extra||{}){if(Object.prototype.hasOwnProperty.call(extra,k))p.push(encodeURIComponent(k)+'='+encodeURIComponent(extra[k]));}
+  fetch(BASE+path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.join('&')})
+   .then(function(r){return r.json()}).then(cb)
+   .catch(function(e){tmsg('请求失败：'+e,'warn')});
+}
+function tmsg(text,kind){
+  var el=document.getElementById('tmsg');el.textContent=text;
+  el.className='cfgmsg show'+(kind?' '+kind:'');
+}
+function clearMsg(){document.getElementById('tmsg').className='cfgmsg';}
+function val(id){var e=document.getElementById(id);return e?String(e.value||'').trim():'';}
+function maskFrom(p,n){var s='';for(var i=0;i<n;i++)s+=document.getElementById(p+i).checked?'1':'0';return s;}
+function setMask(p,s){s=s||'';for(var i=0;i<3;i++){var el=document.getElementById(p+i);if(el)el.checked=s.charAt(i)==='1';}}
+function daysFrom(){var s='';for(var d=1;d<=7;d++)if(document.getElementById('day'+d).checked)s+=String(d);return s;}
+function setDays(s){s=s||'';for(var d=1;d<=7;d++)document.getElementById('day'+d).checked=s.indexOf(String(d))>=0;}
+function ratiosFrom(){var a=[],els=document.querySelectorAll('#ratio_box input:checked');
+  for(var i=0;i<els.length;i++)a.push(els[i].value);return a.join(',');}
+function setRatios(s){var a=String(s||'').split(','),els=document.querySelectorAll('#ratio_box input');
+  for(var i=0;i<els.length;i++)els[i].checked=a.indexOf(els[i].value)>=0;}
+function sortFrom(){var els=document.querySelectorAll('#sort_box input');
+  for(var i=0;i<els.length;i++)if(els[i].checked)return els[i].value;return 'hot';}
+function setSort(s){s=s||'hot';var els=document.querySelectorAll('#sort_box input');
+  for(var i=0;i<els.length;i++)els[i].checked=els[i].value===s;}
+(function(){var box=document.getElementById('sort_box');if(!box)return;
+  box.addEventListener('change',function(e){
+    var t=e.target;if(!t||t.tagName!=='INPUT')return;
+    if(!t.checked){t.checked=true;return;}   /* single-choice: keep one selected */
+    var els=box.querySelectorAll('input');
+    for(var i=0;i<els.length;i++)if(els[i]!==t)els[i].checked=false;
+  });
+})();
+var apiKeySet=false;
+function applyKeyState(set){
+  apiKeySet=!!set;
+  var el=document.getElementById('keystate');
+  el.textContent=apiKeySet?'已设置 · 可选 Sketchy / NSFW':'未设置 · 仅 SFW';
+  el.className='badge '+(apiKeySet?'on':'off');
+  var ids=['pur1','pur2'];
+  for(var i=0;i<ids.length;i++){
+    var x=document.getElementById(ids[i]);if(!x)continue;
+    x.disabled=!apiKeySet;
+    var l=document.getElementById(ids[i]+'_l');if(l)l.className=apiKeySet?'':'off';
+  }
+  if(!apiKeySet){for(i=0;i<ids.length;i++)document.getElementById(ids[i]).checked=false;}
+}
+document.getElementById('keysave').onclick=function(){
+  var btn=this;btn.disabled=true;
+  tpost('/_api_key',{api_key:document.getElementById('api_key').value},function(j){
+    btn.disabled=false;
+    if(j.ok){tmsg(j.message,'ok');applyKeyState(j.api_key_set);poll();}
+    else tmsg(j.error||'保存失败','warn');
+  });
+};
+function tcfgFromForm(){
+  return {type:'fetch',target:val('t_target'),count:val('t_count'),
+    categories:maskFrom('cat',3),purity:maskFrom('pur',3),
+    ratios:ratiosFrom(),sorting:sortFrom(),
+    short_edge:val('t_short'),start_page:val('t_start'),end_page:val('t_end'),
+    min_favorites:val('t_minfav'),min_size_kb:val('t_minsize'),
+    max_size_mb:val('t_maxsize'),query:'',api_key:'',
+    clear_before:document.getElementById('t_clear').checked?'1':'0'};
+}
+function fillForm(cfg){
+  setMask('cat',cfg.categories||'111');
+  setMask('pur',cfg.purity||'100');
+  setRatios(cfg.ratios||'');
+  setSort(cfg.sorting||'hot');
+  var map={t_target:'target',t_count:'count',t_short:'short_edge',
+    t_start:'start_page',t_end:'end_page',t_minfav:'min_favorites',
+    t_minsize:'min_size_kb',t_maxsize:'max_size_mb'};
+  for(var id in map){if(Object.prototype.hasOwnProperty.call(map,id)){
+    var el=document.getElementById(id);if(el)el.value=cfg[map[id]]==null?'':cfg[map[id]];}}
+  document.getElementById('t_clear').checked=!!cfg.clear_before;
+  applyKeyState(apiKeySet);
+}
+function resetForm(){
+  document.getElementById('t_name').value='';
+  document.getElementById('t_time').value='03:00';
+  document.getElementById('t_enabled').value='1';
+  setDays('1234567');
+  fillForm(TDEF);
+  editingId='';
+}
+var editingId='';
+var TSTATUS={'idle':'就绪','running':'采集中','done':'已完成','error':'失败',
+  'cancelled':'已停止','empty':'无匹配图'};
+var DAYN={'1':'一','2':'二','3':'三','4':'四','5':'五','6':'六','7':'日'};
+var SORTN={hot:'热门',toplist:'最近一周',favorites:'收藏量',views:'浏览量'};
+var RATIOMAP={landscape:'横屏',portrait:'竖屏','1x1':'正方形',
+  '16x9':'16:9','16x10':'16:10','3x2':'3:2','4x3':'4:3','5x4':'5:4',
+  '21x9':'21:9','32x9':'32:9','48x9':'48:9',
+  '9x16':'9:16','10x16':'10:16','9x18':'9:18'};
+function ratioLabel(s){
+  if(!s)return '';
+  var a=String(s).split(','),out=[];
+  for(var i=0;i<a.length;i++)out.push(RATIOMAP[a[i]]||a[i]);
+  return out.join('/');
+}
+function dayLabel(s){
+  s=s||'';if(!s)return '单次';
+  var a=[];for(var i=0;i<s.length;i++)a.push('周'+(DAYN[s.charAt(i)]||s.charAt(i)));
+  return '每周'+a.join('/');
+}
+function filterLabel(cfg){
+  cfg=cfg||{};var r=[];
+  if(cfg.categories&&cfg.categories!=='111')r.push('类型'+cfg.categories);
+  if(cfg.purity&&cfg.purity!=='100')r.push('纯度'+cfg.purity);
+  if(cfg.ratios)r.push('比例'+ratioLabel(cfg.ratios));
+  r.push('第'+(cfg.start_page?cfg.start_page:'随机')+'页-'+(cfg.end_page?cfg.end_page:'不限'));
+  r.push((SORTN[cfg.sorting]||cfg.sorting||'Hot')+'排序');
+  return r.join(' · ');
+}
+function renderTasks(tasks,now){
+  var box=document.getElementById('tasklist');
+  tasks=tasks.filter(function(t){return (t.type||'fetch')!=='compress';});
+  if(!tasks.length){box.innerHTML='<p class="meta">还没有采集任务，点下方「新建任务」开始。</p>';return;}
+  var h='';
+  for(var i=0;i<tasks.length;i++){
+    var t=tasks[i];
+    var st=t.running?'运行中':(TSTATUS[t.phase]||TSTATUS[t.last_status]||t.last_status||'就绪');
+    var prog=t.running&&t.total>0?(' '+t.done+'/'+t.total+' 张'):'';
+    var last=t.last_run?('上次 '+esc(t.last_run)+' · '+esc(t.last_count)+' 张'):'尚未运行';
+    var due=(!t.running&&t.enabled&&t.time===now)?' · 本分钟待触发':'';
+    h+='<div class="api"><div class="name"><b>'+esc(t.name)+'</b> '
+      +'<span class="badge">'+esc(t.target)+'</span> '
+      +'<span class="badge">'+esc(t.time)+' · '+esc(dayLabel(t.days))+'</span></div>';
+    h+='<div class="note">'+esc(st)+esc(prog)+' · '+(t.enabled?'已启用':'已停用')
+      +' · 每次 '+esc(t.count)+' 张 · '+esc(filterLabel(t.cfg))+'</div>';
+    h+='<div class="note">'+esc(last)+esc(due)+'</div>';
+    if(t.error)h+='<div class="note warn">'+esc(t.error)+'</div>';
+    h+='<div class="acts tacts">';
+    h+='<button data-act="toggle" data-id="'+esc(t.id)+'">'+(t.enabled?'停用':'启用')+'</button>';
+    h+='<button data-act="run" data-id="'+esc(t.id)+'"'+(t.running?' disabled':'')+'>立即运行</button>';
+    h+='<button data-act="stop" data-id="'+esc(t.id)+'"'+(t.running?'':' disabled')+'>停止</button>';
+    h+='<button data-act="edit" data-id="'+esc(t.id)+'">编辑</button>';
+    h+='<button data-act="log" data-id="'+esc(t.id)+'">日志</button>';
+    h+='<button data-act="delete" data-id="'+esc(t.id)+'">删除</button>';
+    h+='</div></div>';
+  }
+  box.innerHTML=h;
+}
+/* ---- image compression tasks (share the same task queue & scheduler) ---- */
+var ZSTATUS={'idle':'就绪','running':'压缩中','done':'已完成','error':'失败',
+  'cancelled':'已停止','empty':'无需要处理'};
+function zcfgLabel(cfg){
+  cfg=cfg||{};var r=[];
+  r.push('短边≤'+(cfg.max_height?cfg.max_height:'不限'));
+  r.push('体积≤'+(cfg.max_size_mb?cfg.max_size_mb+'MB':'不限'));
+  r.push('质量'+(cfg.q_min||85)+'-'+(cfg.q_max||98));
+  r.push(cfg.to_jpg?'转JPG':'仅压JPG');
+  if(cfg.recursive)r.push('含子目录');
+  return r.join(' · ');
+}
+function renderZipTasks(tasks,now){
+  var box=document.getElementById('zlist');
+  tasks=tasks.filter(function(t){return t.type==='compress';});
+  if(!tasks.length){box.innerHTML='<p class="meta">还没有压缩任务，点下方「新建压缩任务」开始。</p>';return;}
+  var h='';
+  for(var i=0;i<tasks.length;i++){
+    var t=tasks[i];
+    var st=t.running?'运行中':(ZSTATUS[t.phase]||ZSTATUS[t.last_status]||t.last_status||'就绪');
+    var prog=t.running&&t.total>0?(' '+t.done+'/'+t.total+' 张'):'';
+    var last=t.last_run?('上次 '+esc(t.last_run)+' · '+esc(t.last_count)+' 张'):'尚未运行';
+    var due=(!t.running&&t.enabled&&t.time===now)?' · 本分钟待触发':'';
+    h+='<div class="api"><div class="name"><b>'+esc(t.name)+'</b> '
+      +'<span class="badge">'+esc(t.time)+' · '+esc(dayLabel(t.days))+'</span></div>';
+    h+='<div class="note">'+esc(st)+esc(prog)+' · '+(t.enabled?'已启用':'已停用')+' · '+zcfgLabel(t.cfg)+'</div>';
+    h+='<div class="note">源：<code>'+esc((t.cfg&&t.cfg.src_dir)||'')+'</code></div>';
+    h+='<div class="note">'+esc(last)+esc(due)+'</div>';
+    if(t.error)h+='<div class="note warn">'+esc(t.error)+'</div>';
+    h+='<div class="acts tacts">';
+    h+='<button data-act="toggle" data-id="'+esc(t.id)+'">'+(t.enabled?'停用':'启用')+'</button>';
+    h+='<button data-act="run" data-id="'+esc(t.id)+'"'+(t.running?' disabled':'')+'>立即运行</button>';
+    h+='<button data-act="stop" data-id="'+esc(t.id)+'"'+(t.running?'':' disabled')+'>停止</button>';
+    h+='<button data-act="edit" data-id="'+esc(t.id)+'">编辑</button>';
+    h+='<button data-act="log" data-id="'+esc(t.id)+'">日志</button>';
+    h+='<button data-act="delete" data-id="'+esc(t.id)+'">删除</button>';
+    h+='</div></div>';
+  }
+  box.innerHTML=h;
+}
+function zDaysFrom(){var s='';for(var d=1;d<=7;d++)if(document.getElementById('zday'+d).checked)s+=String(d);return s;}
+function zSetDays(s){s=s||'';for(var d=1;d<=7;d++)document.getElementById('zday'+d).checked=s.indexOf(String(d))>=0;}
+function zCfgFromForm(){
+  return {type:'compress',src_dir:val('z_src'),backup_dir:val('z_backup'),
+    max_height:val('z_height'),max_size_mb:val('z_size'),
+    q_max:val('z_qmax'),q_min:val('z_qmin'),
+    to_jpg:document.getElementById('z_tojpg').checked?'1':'0',
+    recursive:document.getElementById('z_rec').checked?'1':'0'};
+}
+function zFillForm(cfg){
+  var map={z_src:'src_dir',z_backup:'backup_dir',z_height:'max_height',
+    z_size:'max_size_mb',z_qmax:'q_max',z_qmin:'q_min'};
+  for(var id in map){if(Object.prototype.hasOwnProperty.call(map,id)){
+    var el=document.getElementById(id);if(el)el.value=cfg[map[id]]==null?'':cfg[map[id]];}}
+  document.getElementById('z_tojpg').checked=String(cfg.to_jpg)!=='0';
+  document.getElementById('z_rec').checked=String(cfg.recursive)==='1';
+}
+function zResetForm(){
+  document.getElementById('z_name').value='';
+  document.getElementById('z_time').value='03:00';
+  document.getElementById('z_enabled').value='1';
+  zSetDays('1234567');
+  zFillForm(CDEF);
+  zEditingId='';
+}
+var zEditingId='';
+var knownTasks={};
+function poll(){
+  fetch(BASE+'/_tasks',{cache:'no-store'})
+   .then(function(r){return r.json()}).then(function(j){
+     if(!j.ok)return;
+     applyKeyState(j.api_key_set);
+     knownTasks={};for(var i=0;i<j.tasks.length;i++)knownTasks[j.tasks[i].id]=j.tasks[i];
+     renderTasks(j.tasks,j.now);
+     renderZipTasks(j.tasks,j.now);
+     var running=null,zipRunning=null;
+     for(var id in knownTasks){var tk=knownTasks[id];if(tk.running){
+       if(tk.type==='compress'){if(!zipRunning)zipRunning=tk;}
+       else if(!running)running=tk;}}
+     if(running){
+       var box=document.getElementById('tlog');box.style.display='block';
+       box.textContent=(running.log||[]).join(String.fromCharCode(10));box.scrollTop=box.scrollHeight;
+     }
+     if(zipRunning){
+       var zbox=document.getElementById('zlog');zbox.style.display='block';
+       zbox.textContent=(zipRunning.log||[]).join(String.fromCharCode(10));zbox.scrollTop=zbox.scrollHeight;
+     }
+     setTimeout(poll,3000);
+   }).catch(function(){setTimeout(poll,5000)});
+}
+document.getElementById('tasklist').addEventListener('click',function(e){
+  var b=e.target.closest('button[data-act]');if(!b)return;
+  var act=b.getAttribute('data-act'),id=b.getAttribute('data-id'),t=knownTasks[id];
+  if(act==='edit'&&t){
+    editingId=id;
+    document.getElementById('t_name').value=t.name;
+    document.getElementById('t_time').value=t.time;
+    document.getElementById('t_enabled').value=t.enabled?'1':'0';
+    setDays(t.days||'');
+    fillForm(t.cfg||TDEF);
+    document.getElementById('tformbox').open=true;
+    document.getElementById('t_name').scrollIntoView({block:'center'});
+    clearMsg();
+  }else if(act==='log'&&t){
+    var box=document.getElementById('tlog');box.style.display='block';
+    box.textContent=(t.log&&t.log.length)?t.log.join(String.fromCharCode(10)):'（暂无日志）';
+  }else if(act==='delete'){
+    if(!window.confirm('确定删除这个采集任务？'))return;
+    tpost('/_tasks/delete',{id:id},function(j){
+      if(j.ok){tmsg('任务已删除','ok');poll();}else tmsg(j.error||'删除失败','warn');});
+  }else if(act==='toggle'){
+    tpost('/_tasks/toggle',{id:id},function(j){if(j.ok)poll();else tmsg(j.error||'操作失败','warn');});
+  }else if(act==='run'){
+    clearMsg();tpost('/_tasks/run',{id:id},function(j){if(j.ok){tmsg('任务已加入执行队列','ok');poll();}else tmsg(j.error||'启动失败','warn');});
+  }else if(act==='stop'){
+    tpost('/_tasks/stop',{id:id},function(j){if(j.ok)poll();else tmsg(j.error||'停止失败','warn');});
+  }
+});
+document.getElementById('tnew').onclick=function(){resetForm();document.getElementById('tformbox').open=true;clearMsg();document.getElementById('t_name').scrollIntoView({block:'center'});};
+document.getElementById('tcancel').onclick=function(){resetForm();document.getElementById('tformbox').open=false;clearMsg();};
+document.getElementById('tsave').onclick=function(){
+  var btn=this;btn.disabled=true;clearMsg();
+  var body=tcfgFromForm();
+  body.id=editingId;
+  body.name=val('t_name');
+  body.time=val('t_time');
+  body.days=daysFrom();
+  body.enabled=val('t_enabled');
+  tpost('/_tasks/save',body,function(j){
+    btn.disabled=false;
+    if(!j.ok){tmsg('保存失败：'+(j.error||'未知错误'),'warn');return;}
+    tmsg('任务已保存','ok');resetForm();document.getElementById('tformbox').open=false;poll();
+  });
+};
+function zmsg(text,kind){
+  var el=document.getElementById('zmsg');el.textContent=text;
+  el.className='cfgmsg show'+(kind?' '+kind:'');
+}
+function zclearMsg(){document.getElementById('zmsg').className='cfgmsg';}
+document.getElementById('zlist').addEventListener('click',function(e){
+  var b=e.target.closest('button[data-act]');if(!b)return;
+  var act=b.getAttribute('data-act'),id=b.getAttribute('data-id'),t=knownTasks[id];
+  if(act==='edit'&&t){
+    zEditingId=id;
+    document.getElementById('z_name').value=t.name;
+    document.getElementById('z_time').value=t.time;
+    document.getElementById('z_enabled').value=t.enabled?'1':'0';
+    zSetDays(t.days||'');
+    zFillForm(t.cfg||CDEF);
+    document.getElementById('zformbox').open=true;
+    document.getElementById('z_name').scrollIntoView({block:'center'});
+    zclearMsg();
+  }else if(act==='log'&&t){
+    var box=document.getElementById('zlog');box.style.display='block';
+    box.textContent=(t.log&&t.log.length)?t.log.join(String.fromCharCode(10)):'（暂无日志）';
+  }else if(act==='delete'){
+    if(!window.confirm('确定删除这个压缩任务？'))return;
+    tpost('/_tasks/delete',{id:id},function(j){
+      if(j.ok){zmsg('任务已删除','ok');poll();}else zmsg(j.error||'删除失败','warn');});
+  }else if(act==='toggle'){
+    tpost('/_tasks/toggle',{id:id},function(j){if(j.ok)poll();else zmsg(j.error||'操作失败','warn');});
+  }else if(act==='run'){
+    zclearMsg();tpost('/_tasks/run',{id:id},function(j){if(j.ok){zmsg('任务已加入执行队列','ok');poll();}else zmsg(j.error||'启动失败','warn');});
+  }else if(act==='stop'){
+    tpost('/_tasks/stop',{id:id},function(j){if(j.ok)poll();else zmsg(j.error||'停止失败','warn');});
+  }
+});
+document.getElementById('znew').onclick=function(){zResetForm();document.getElementById('zformbox').open=true;zclearMsg();document.getElementById('z_name').scrollIntoView({block:'center'});};
+document.getElementById('zcancel').onclick=function(){zResetForm();document.getElementById('zformbox').open=false;zclearMsg();};
+document.getElementById('zsave').onclick=function(){
+  var btn=this;btn.disabled=true;zclearMsg();
+  var body=zCfgFromForm();
+  body.id=zEditingId;
+  body.name=val('z_name');
+  body.time=val('z_time');
+  body.days=zDaysFrom();
+  body.enabled=val('z_enabled');
+  tpost('/_tasks/save',body,function(j){
+    btn.disabled=false;
+    if(!j.ok){zmsg('保存失败：'+(j.error||'未知错误'),'warn');return;}
+    zmsg('任务已保存','ok');zResetForm();document.getElementById('zformbox').open=false;poll();
+  });
+};
+poll();
 </script></body></html>""")
 
 
@@ -600,10 +2316,10 @@ def index_page(host_header, cfg, base=""):
                     % html.escape(err))
         else:
             encoded = quote(name)
-            acts = ('<a class="pv" href="%s/%s" data-p="%s" target="_blank">打开看看</a>'
+            acts = ('<a class="pv" href="%s/%s" data-p="%s" data-n="%d" target="_blank">打开看看</a>'
                     '<button class="cp" data-p="%s">复制地址</button>'
                     % (html.escape(base), html.escape(encoded),
-                       html.escape(encoded), html.escape(encoded)))
+                       html.escape(encoded), count, html.escape(encoded)))
             note = ('<div class="note kv">目录为空，或没有 jpg / jpeg / png / webp / gif / bmp / tiff 图片</div>'
                     if count == 0 else "")
         rows.append(
@@ -625,8 +2341,12 @@ def index_page(host_header, cfg, base=""):
             stored = (json.load(fh).get("image_root") or "")
     except (OSError, ValueError):
         pass
+    # New-task defaults follow the table: 0 = unlimited/random, Hot sorting.
+    # The API key is global and never echoed into the task form.
+    tdef = json.dumps(FETCH_DEFAULTS, ensure_ascii=False)
+    cdef = json.dumps(COMPRESS_DEFAULTS, ensure_ascii=False)
     return PAGE.substitute(
-        title=APP_TITLE, version=VERSION, port=cfg["port"],
+        title=APP_TITLE, version=VERSION, port=cfg["port"], tdef=tdef, cdef=cdef,
         root=html.escape(cfg["image_root"]),
         # config.json is intentionally empty when the root is auto-detected
         # from fnOS TRIM_DATA_ACCESSIBLE_PATHS. Still show the effective path
@@ -751,6 +2471,192 @@ class Handler(BaseHTTPRequestHandler):
             "message": "端口已修改，服务正在重启" if restart else "配置已保存并立即生效",
         })
 
+    def _fetch_form(self, form):
+        def val(key):
+            return (form.get(key) or [""])[0].strip()
+        raw = {key: val(key) for key in FETCH_DEFAULTS}
+        # The API key is never echoed back into the page. An empty field means
+        # "keep the stored one"; otherwise saving other settings would wipe it.
+        if not raw.get("api_key"):
+            raw["api_key"] = load_fetch_config().get("api_key", "")
+        cfg, err = fetch_valid(raw)
+        if cfg:
+            apply_global_key(cfg)
+        return cfg, err
+
+    def handle_fetch_config(self, form):
+        cfg, err = self._fetch_form(form)
+        if err:
+            return self.send_json({"ok": False, "error": err}, 400)
+        try:
+            save_fetch_config(cfg)
+        except OSError as exc:
+            return self.send_json({"ok": False, "error": "配置写入失败：%s" % exc}, 500)
+        return self.send_json({"ok": True})
+
+    def handle_fetch_start(self, form):
+        cfg, err = self._fetch_form(form)
+        if err:
+            return self.send_json({"ok": False, "error": err}, 400)
+        with _fetch_lock:
+            if _fetch_state["running"]:
+                return self.send_json({"ok": False, "error": "已有采集任务在运行"}, 409)
+        try:
+            save_fetch_config(cfg)
+        except OSError as exc:
+            return self.send_json({"ok": False, "error": "配置写入失败：%s" % exc}, 500)
+        _cancel.clear()
+        _fetch_set(running=True, phase="running", done=0, total=cfg["count"],
+                   page=0, error="", started=time.time(), finished=0, log=[])
+        threading.Thread(target=wh_collect, args=(cfg,), daemon=True).start()
+        with _fetch_lock:
+            snap = {k: list(v) if k == "log" else v for k, v in _fetch_state.items()}
+        return self.send_json({"ok": True, "state": snap})
+
+    def handle_fetch_stop(self):
+        _cancel.set()
+        with _fetch_lock:
+            snap = {k: list(v) if k == "log" else v for k, v in _fetch_state.items()}
+        return self.send_json({"ok": True, "state": snap})
+
+    def _form_val(self, form, key):
+        return (form.get(key) or [""])[0].strip()
+
+    def handle_tasks_get(self):
+        with _tasks_lock:
+            items = [task_public(t) for t in _tasks]
+        key_set = bool(load_fetch_config().get("api_key"))
+        return self.send_json({"ok": True, "tasks": items,
+                               "now": time.strftime("%H:%M"),
+                               "weekday": str(time.localtime().tm_wday + 1),
+                               "api_key_set": key_set, "sfw_only": not key_set})
+
+    def handle_api_key(self, form):
+        """Global API Key. Blank means Wallhaven SFW-only (table rule)."""
+        key = self._form_val(form, "api_key")
+        fc = load_fetch_config()
+        fc["api_key"] = key
+        try:
+            save_fetch_config(fc)
+        except OSError as exc:
+            return self.send_json({"ok": False, "error": "写入失败：%s" % exc}, 500)
+        with _tasks_lock:
+            for t in _tasks:
+                t["cfg"] = apply_global_key(t["cfg"])
+        save_tasks()
+        return self.send_json({
+            "ok": True, "api_key_set": bool(key),
+            "message": ("API Key 已保存，含 Sketchy / NSFW 的筛选会生效" if key
+                        else "已清空 API Key，所有任务强制仅下载 SFW"),
+        })
+
+    def handle_tasks_save(self, form):
+        tid = self._form_val(form, "id")
+        name = self._form_val(form, "name")
+        tm = valid_time(self._form_val(form, "time"))
+        if not name:
+            return self.send_json({"ok": False, "error": "任务名称不能为空"}, 400)
+        if not tm:
+            return self.send_json({"ok": False, "error": "执行时刻格式应为 HH:MM（00:00-23:59）"}, 400)
+        kind = self._form_val(form, "type") or "fetch"
+        if kind not in ("fetch", "compress"):
+            kind = "fetch"
+        if kind == "compress":
+            raw = {k: self._form_val(form, k) for k in COMPRESS_DEFAULTS}
+            cfg, err = compress_valid(raw)
+        else:
+            raw = {k: self._form_val(form, k) for k in FETCH_DEFAULTS}
+            cfg, err = fetch_valid(raw)
+            if not err:
+                cfg = apply_global_key(cfg)   # global key; blank key -> SFW only
+        if err:
+            return self.send_json({"ok": False, "error": err}, 400)
+        if "days" in form:
+            days = valid_days(self._form_val(form, "days"))
+        else:                            # legacy client sending only `loop`
+            days = ("1234567" if self._form_val(form, "loop")
+                    in ("1", "true", "on", "yes") else "")
+        enabled = self._form_val(form, "enabled") in ("1", "true", "on", "yes")
+        with _tasks_lock:
+            if tid:
+                t = next((x for x in _tasks if x["id"] == tid), None)
+                if not t:
+                    return self.send_json({"ok": False, "error": "任务不存在"}, 404)
+                t.update(name=name, time=tm, days=days, cfg=cfg, enabled=enabled, type=kind)
+            else:
+                tid = new_task_id()
+                _tasks.append({"id": tid, "type": kind, "name": name, "enabled": enabled,
+                               "time": tm, "days": days, "last_run": "",
+                               "last_status": "idle", "last_count": 0, "cfg": cfg})
+                task_rt(tid)
+        save_tasks()
+        with _tasks_lock:
+            t = next(x for x in _tasks if x["id"] == tid)
+            return self.send_json({"ok": True, "task": task_public(t)})
+
+    def handle_tasks_delete(self, form):
+        tid = self._form_val(form, "id")
+        with _tasks_lock:
+            before = len(_tasks)
+            _tasks[:] = [x for x in _tasks if x["id"] != tid]
+            if len(_tasks) == before:
+                return self.send_json({"ok": False, "error": "任务不存在"}, 404)
+            _task_rt.pop(tid, None)
+        save_tasks()
+        return self.send_json({"ok": True})
+
+    def handle_image_delete(self, form):
+        cat = self._form_val(form, "cat")
+        try:
+            idx = int(self._form_val(form, "i") or "0")
+        except ValueError:
+            idx = 0
+        ok, payload = delete_preview_image(cat, idx)
+        if not ok:
+            return self.send_json({"ok": False, "error": payload}, 400)
+        return self.send_json(payload)
+
+    def handle_tasks_toggle(self, form):
+        tid = self._form_val(form, "id")
+        with _tasks_lock:
+            t = next((x for x in _tasks if x["id"] == tid), None)
+            if not t:
+                return self.send_json({"ok": False, "error": "任务不存在"}, 404)
+            t["enabled"] = not t["enabled"]
+            enabled = t["enabled"]
+        save_tasks()
+        return self.send_json({"ok": True, "enabled": enabled})
+
+    def handle_tasks_run(self, form):
+        tid = self._form_val(form, "id")
+        with _tasks_lock:
+            t = next((x for x in _tasks if x["id"] == tid), None)
+            if not t:
+                return self.send_json({"ok": False, "error": "任务不存在"}, 404)
+            rt = task_rt(tid)
+            busy = rt["running"]
+        if busy:
+            return self.send_json({"ok": False, "error": "该任务正在运行"}, 409)
+        _task_queue.put(tid)
+        return self.send_json({"ok": True})
+
+    def handle_tasks_stop(self, form):
+        tid = self._form_val(form, "id")
+        with _tasks_lock:
+            rt = _task_rt.get(tid)
+            if not rt or not rt["running"]:
+                return self.send_json({"ok": False, "error": "该任务未在运行"}, 409)
+            rt["cancel"].set()
+        return self.send_json({"ok": True})
+
+    def handle_tasks_status(self, form):
+        tid = self._form_val(form, "id")
+        with _tasks_lock:
+            t = next((x for x in _tasks if x["id"] == tid), None)
+            if not t:
+                return self.send_json({"ok": False, "error": "任务不存在"}, 404)
+            return self.send_json({"ok": True, "task": task_public(t)})
+
     def handle_reload(self):
         cfg = load_config()
         if cfg["port"] != BOUND_PORT:
@@ -791,6 +2697,14 @@ class Handler(BaseHTTPRequestHandler):
             })
         if path == "/_config":
             return self.send_json({"ok": False, "error": "Use POST."}, 405)
+        if path == "/_tasks":
+            return self.handle_tasks_get()
+        if path == "/_fetch_status":
+            with _fetch_lock:
+                snap = {k: (list(v) if k == "log" else v)
+                        for k, v in _fetch_state.items()}
+            snap["ok"] = True
+            return self.send_json(snap)
         if path == "/" or path == "/index.html":
             return self._send(200, index_page(self.headers.get("Host", ""), cfg, base),
                               "text/html; charset=utf-8")
@@ -815,6 +2729,22 @@ class Handler(BaseHTTPRequestHandler):
                     "fnOS File Manager > Details > Permissions > Advanced to enable "
                     "inheritance; the app permission list only covers top-level shares." % err, 403)
             return self.send_text("No images found in this category.", 404)
+        # Preview wants newest-downloaded first, walked in order; the plain URL
+        # (used by copy-link and third parties) stays random. order=recent&i=N
+        # selects the N-th item sorted by file mtime descending.
+        query = parse_qs(urlparse(self.path).query)
+        if query.get("order") == ["recent"]:
+            def _mtime(p):
+                try:
+                    return os.path.getmtime(p)
+                except OSError:
+                    return 0.0
+            ordered = sorted(cats[canonical], key=lambda p: (_mtime(p), p), reverse=True)
+            try:
+                idx = int(query.get("i", ["0"])[0])
+            except (ValueError, IndexError):
+                idx = 0
+            return self.send_image(ordered[idx % len(ordered)])
         return self.send_image(random.choice(cats[canonical]))
 
     def do_GET(self):
@@ -839,8 +2769,30 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/_config":
                 return self.handle_config(form)
+            if path == "/_api_key":
+                return self.handle_api_key(form)
             if path == "/_reload":
                 return self.handle_reload()
+            if path == "/_image/delete":
+                return self.handle_image_delete(form)
+            if path == "/_tasks/save":
+                return self.handle_tasks_save(form)
+            if path == "/_tasks/delete":
+                return self.handle_tasks_delete(form)
+            if path == "/_tasks/toggle":
+                return self.handle_tasks_toggle(form)
+            if path == "/_tasks/run":
+                return self.handle_tasks_run(form)
+            if path == "/_tasks/stop":
+                return self.handle_tasks_stop(form)
+            if path == "/_tasks/status":
+                return self.handle_tasks_status(form)
+            if path == "/_fetch_start":
+                return self.handle_fetch_start(form)
+            if path == "/_fetch_stop":
+                return self.handle_fetch_stop()
+            if path == "/_fetch_config":
+                return self.handle_fetch_config(form)
             return self.send_text("Not found.", 404)
         except Exception as exc:
             log("ERROR POST %s: %s" % (path, exc))
@@ -888,6 +2840,7 @@ def main():
     st = root_status(cfg)
     log("starting RanPix v%s port=%s root=%s readable=%s py=%s"
         % (VERSION, cfg["port"], cfg["image_root"], st["readable"], sys.version.split()[0]))
+    start_tasks()
     tcp = ThreadingHTTPServer(("0.0.0.0", cfg["port"]), Handler)
     tcp.daemon_threads = True
     unix = start_gateway()
@@ -899,6 +2852,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        _sched_stop.set()
+        _cancel.set()
         tcp.server_close()
         if unix:
             unix.server_close()
