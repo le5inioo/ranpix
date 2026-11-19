@@ -1,6 +1,6 @@
 appname               = ranpix
-version               = 2.0.0
-changelog             = RanPix 2.0.0：新增 Wallhaven 壁纸采集（多任务/周几定时/顺序下载/全局 API Key/黑名单）与图片压缩任务（系统 ffmpeg），采集与压缩均可定时循环；含短边缩放、顺序预览、删除拉黑。
+version               = 2.0.4
+changelog             = RanPix 2.0.4：删除图片后不再显示「已删除·已拉黑」等任何中间状态——删除成功即直接切下一张，按钮全程保持「删除」。保留 x/y 索引、手机滑动切图、不再提醒、魔术师批量拉黑等功能。
 display_name          = RanPix
 desc                  = 一个轻量的随机图片API 应用 · 每个子文件夹就是一个独立随机图片接口 · 支持 Wallhaven 采集与图片压缩任务
 platform              = x86

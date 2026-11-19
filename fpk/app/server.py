@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 APPNAME = "ranpix"
 APP_TITLE = "RanPix"
-VERSION = "2.0.0"
+VERSION = "2.0.4"
 DEFAULT_PORT = 18580
 GATEWAY_PREFIX = "/app/ranpix"
 SOCKET_NAME = "ranpix.sock"
@@ -265,6 +265,49 @@ def add_blacklist(wid):
         ids.add(wid)
         save_blacklist(ids)
     return True
+
+
+def sweep_missing_blacklist():
+    """Magic sweep: blacklist IDs whose image was deleted outside RanPix.
+
+    When the user removes a collected file via the file manager (or any other
+    means), the ID is still listed in that category's downloaded.txt. On the
+    next collection run that ID would be skipped only for that one folder;
+    this sweep records it in the GLOBAL blacklist so every task skips it.
+
+    Collected files are named wallhaven-<id>.<ext> and downloaded.txt holds
+    the bare <id>. Any recorded ID with no surviving matching file is treated
+    as manually deleted. Returns (ok, payload).
+    """
+    _cache["ts"] = 0.0                  # force rescan to see external deletions
+    cfg = load_config()
+    root = cfg["image_root"]
+    cats = categories()
+    scanned = 0
+    missing = set()
+    for name, paths in cats.items():
+        folder = os.path.join(root, name) if name else root
+        state = os.path.join(folder, "downloaded.txt")
+        try:
+            with open(state, "r", encoding="utf-8") as fh:
+                recorded = {line.strip().lower() for line in fh if line.strip()}
+        except OSError:
+            continue
+        if not recorded:
+            continue
+        scanned += len(recorded)
+        present = {image_wid(p) for p in paths}
+        present.discard("")
+        missing |= (recorded - present)
+
+    added = 0
+    for wid in sorted(missing):
+        if add_blacklist(wid):
+            added += 1
+    log("magic sweep: %d recorded IDs, %d missing, %d newly blacklisted"
+        % (scanned, len(missing), added))
+    return True, {"ok": True, "scanned": scanned, "missing": len(missing),
+                  "added": added, "total": len(load_blacklist())}
 
 
 def delete_preview_image(category, index):
@@ -684,36 +727,26 @@ def wh_search(page, cfg):
 
 
 def wh_fetch_image(item, cfg):
-    """Download one wallpaper, falling back to the thumbnail CDN.
+    """Download the full-size original only; never fall back to thumbnails.
 
-    w.wallhaven.cc (full-size) may be blocked on some networks / NAS boxes,
-    while th.wallhaven.cc is usually reachable. Thumb URLs are always .jpg
-    even when the original is .png, so the stored filename follows the source.
+    Wallhaven's API exposes two CDN sets: the original at w.wallhaven.cc
+    (full resolution, matching the atleast/ratio filters) and thumbnails at
+    th.wallhaven.cc (thumbs.original is ~300px, thumbs.large ~430px). A past
+    fallback silently saved those thumbnails when the original CDN failed,
+    producing tiny tens-of-KB files far below the configured minimum size.
+    Fetching the original is now mandatory: on failure this raises and the
+    caller skips the image instead of degrading quality.
 
-    Returns (blob, filename, source_label) or raises the last error.
+    Returns (blob, filename, "原图") or raises the download error.
     """
-    candidates = []
     full = item.get("path") or ""
-    if full:
-        candidates.append((full, os.path.basename(unquote(urlparse(full).path)), "原图"))
-    thumbs = item.get("thumbs") or {}
-    for kind, label in (("original", "高清缩略"), ("large", "大图")):
-        u = thumbs.get(kind) or ""
-        if u:
-            candidates.append((u, os.path.basename(unquote(urlparse(u).path)), label))
-    if not candidates:
-        raise ValueError("API 未返回任何图片地址")
-    last = None
-    for url, name, label in candidates:
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in SUPPORTED or not SAFE_NAME.match(name):
-            continue
-        try:
-            return wh_request(url, cfg["api_key"], timeout=45), name, label
-        except Exception as exc:
-            last = exc
-            continue
-    raise last or ValueError("无可用图片地址")
+    if not full:
+        raise ValueError("API 未返回原图地址")
+    name = os.path.basename(unquote(urlparse(full).path))
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in SUPPORTED or not SAFE_NAME.match(name):
+        raise ValueError("原图文件名不合法：%s" % name)
+    return wh_request(full, cfg["api_key"], timeout=45), name, "原图"
 
 
 def _fetch_note(text, limit=80):
@@ -881,8 +914,8 @@ def wh_collect(cfg, ctx=None):
                 tmp = ""
                 try:
                     blob, name, label = wh_fetch_image(it, cfg)
-                    # Thumbnails are much smaller than the API-reported full
-                    # file size, so only the upper bound applies to them.
+                    # Only originals are downloaded now; guard against a
+                    # truncated/placeholder response slipping into the library.
                     if len(blob) > max_size or len(blob) < 2048:
                         note("跳过 %s（实际 %d 字节不符）" % (name, len(blob)))
                         continue
@@ -1593,19 +1626,34 @@ background-repeat:no-repeat;background-position:right 10px center;padding-right:
 #pv{position:fixed;top:0;left:0;right:0;bottom:0;inset:0;z-index:9999;
 display:flex;align-items:center;justify-content:center;padding:14px;
 background:rgba(20,24,30,.74)}
-#pv .card{background:#fff;border-radius:12px;width:100%;max-width:520px;
+#pv .card{position:relative;background:#fff;border-radius:12px;width:100%;max-width:520px;
 max-height:100%;display:flex;flex-direction:column;overflow:hidden;padding:0;
 margin:0;border:1px solid #e3e6ea}
 #pv .bar{display:flex;align-items:center;justify-content:space-between;gap:10px;
 padding:10px 14px;border-bottom:1px solid #eef0f2;font-size:14px;min-width:0}
 #pv .bar span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #pv .body{flex:1 1 auto;min-height:140px;display:flex;align-items:center;
-justify-content:center;padding:12px;background:#f5f7fa;overflow:auto}
-#pv img{max-width:100%;max-height:58vh;object-fit:contain;border-radius:6px}
+justify-content:center;padding:12px;background:#f5f7fa;overflow:auto;position:relative}
+#pv .frame{position:relative;display:inline-block;max-width:100%;line-height:0}
+#pv img{max-width:100%;max-height:58vh;object-fit:contain;border-radius:6px;touch-action:pan-y}
+#pv .pvcount{position:absolute;right:8px;bottom:8px;z-index:2;line-height:1;
+padding:4px 8px;border-radius:10px;font-size:12px;font-weight:600;
+background:rgba(20,24,30,.6);color:#fff;pointer-events:none;user-select:none}
 #pv .err{color:#b42318;font-size:13px;overflow-wrap:anywhere;padding:8px}
 #pv .foot{display:flex;flex-wrap:wrap;align-items:center;gap:8px;
 padding:10px 14px;border-top:1px solid #eef0f2}
 #pv .foot .u{flex:1 1 100%;font-size:12px;color:#656d76;overflow-wrap:anywhere}
+/* delete confirmation with "don't remind again" */
+#pv .cfm{position:absolute;inset:0;z-index:10;display:flex;align-items:center;
+justify-content:center;padding:18px;background:rgba(20,24,30,.55)}
+#pv .cfm .cfmcard{background:#fff;border-radius:12px;width:100%;max-width:340px;
+padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+#pv .cfm .cfmt{font-size:15px;font-weight:650;color:#1f2328;margin-bottom:8px}
+#pv .cfm .cfmd{font-size:13px;line-height:1.6;color:#4a5361;overflow-wrap:anywhere}
+#pv .cfm .cfmk{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px;color:#1f2328;cursor:pointer}
+#pv .cfm .cfmk input{width:16px;height:16px;min-width:0;margin:0;padding:0;
+-webkit-appearance:checkbox;appearance:checkbox;accent-color:#4a63d8}
+#pv .cfm .cfmact{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 @media(max-width:640px){
  .wrap{margin:16px auto 40px;padding:0 12px}
  .card{padding:14px 14px}
@@ -1791,7 +1839,7 @@ padding:10px 14px;border-top:1px solid #eef0f2}
 <b>设置 → 应用管理 → RanPix → 权限设置</b> 授权；该列表只有共享文件夹，<b>选不到子目录</b>。
 子文件夹显示「目录无读取权限」时，到 <b>文件管理 → 选中文件夹 → 详细信息 → 权限 → 高级</b>
 启用继承父级权限（或在父目录上「重置子级权限」）。根目录能读不代表每个子目录都能读。</p>
-<p class="meta">「打开看看」在当前页预览，按<b>下载时间由近到远</b>逐张浏览（上一张 / 下一张）；点「删除」移除该图并加入<b>全局黑名单</b>，此后所有采集任务扫到都会跳过。「复制地址」始终给出<b>随机</b>接口，并<b>跟随当前访问的域名 / IP</b>，端口固定为免登录的服务端口 <code>$port</code>，
+<p class="meta">「打开看看」在当前页预览，按<b>下载时间由近到远</b>逐张浏览（上一张 / 下一张，手机可左右滑动切换）；点「删除」移除该图并加入<b>全局黑名单</b>，此后所有采集任务扫到都会跳过；用文件管理器等方式删掉的图，点「<b>魔术师</b>」可批量补进黑名单。「复制地址」始终给出<b>随机</b>接口，并<b>跟随当前访问的域名 / IP</b>，端口固定为免登录的服务端口 <code>$port</code>，
 因此复制结果可粘贴到任意浏览器或第三方应用（中文接口名自动编码）；从网关入口复制时会自动把端口换成服务端口。</p>
 <p class="meta">注意：<code>$gwurl</code> 是飞牛同源网关地址，只在已登录的桌面 / 手机 App 内有效；
 直接外传会被飞牛统一鉴权拦截，显示 <code>invalid token</code>，所以「复制地址」不会给出这种地址。</p>
@@ -1802,7 +1850,7 @@ padding:10px 14px;border-top:1px solid #eef0f2}
 <b>尺寸限制（短边≥px）</b>转换为 Wallhaven 的 <code>atleast=PxP</code>，即宽和高都不小于该值。
 排序支持热门、最近一周、收藏量、浏览量；壁纸类型与纯净度可多选，
 比例可多选（全不选为不限）。多个任务串行执行，可随时「立即运行」或「停止」，状态每 3 秒刷新。
-已下载的壁纸 ID 记在对应目录下的 <code>downloaded.txt</code>，不会重复下载；原图 CDN 不可达时自动回退高清缩略图。
+已下载的壁纸 ID 记在对应目录下的 <code>downloaded.txt</code>，不会重复下载；只下载原图，原图 CDN 不可达时跳过该张，绝不用缩略图代替。
 <b>API Key 留空时即使勾选了 Sketchy / NSFW 也会强制仅下载 SFW</b>；采集目录需允许应用用户写入。</p>
 <p class="meta"><b>图片压缩任务</b>：把「源目录」里的 jpg / png / bmp / tiff 图片转为 JPG，短边（宽高较小一边）超过上限按比例缩小，
 体积超过上限时逐步降低质量（下限保护细节，每次均从原图重新编码避免反复压缩）；已达标的图跳过。原图按原名备份到「备份目录」（仅一次），
@@ -1834,8 +1882,11 @@ function directUrl(p){
    Gateway URL is tried first (same-origin, carries the App session); if it
    is rejected, fall back to the token-free LAN URL. */
 var pvEl=null,pvP='',pvStage=0,pvSeq=0,pvIdx=0,pvTotal=0;
+var PV_NOREMIND='ranpix_del_noremind';
 function pvClose(){if(pvEl&&pvEl.parentNode){pvEl.parentNode.removeChild(pvEl)}pvEl=null;}
+function pvResetDel(){var b=document.getElementById('pvDel');if(b){b.disabled=false;b.textContent='删除';}}
 function pvLoad(){
+  pvResetDel();
   var img=document.getElementById('pvImg'),err=document.getElementById('pvErr');
   pvStage=0;err.style.display='none';img.style.display='';
   pvSeq++;
@@ -1843,7 +1894,7 @@ function pvLoad(){
   var q='order=recent&i='+pvIdx+'&_='+Date.now()+'-'+pvSeq;
   img.src=gwUrl(pvP)+'?'+q;
   var n=document.getElementById('pvIdx');
-  if(n){var shown=pvTotal?(pvIdx%pvTotal)+1:pvIdx+1;n.textContent='第 '+shown+' / '+(pvTotal||'?')+' 张';}
+  if(n){var shown=pvTotal?(pvIdx%pvTotal)+1:pvIdx+1;n.textContent=shown+'/'+(pvTotal||'?');}
 }
 function pvFail(){
   var img=document.getElementById('pvImg'),err=document.getElementById('pvErr');
@@ -1851,42 +1902,103 @@ function pvFail(){
   img.style.display='none';err.style.display='block';
   err.textContent='图片加载失败。请在与 NAS 同一网络的浏览器中打开这个直连地址：'+directUrl(pvP);
 }
+function pvPrev(){pvIdx=Math.max(0,pvIdx-1);pvLoad();}
+function pvNext(){pvIdx++;pvLoad();}
+/* 自定义确认框：支持「不再提醒」勾选，避免 WebView 原生 confirm 无法带选项 */
+function pvAsk(title,desc,showCheck,okText,onYes){
+  var box=document.getElementById('pvCfm');if(!box)return;
+  document.getElementById('pvCfmt').textContent=title;
+  document.getElementById('pvCfmd').textContent=desc;
+  document.getElementById('pvCfmk').style.display=showCheck?'flex':'none';
+  document.getElementById('pvCfmYes').textContent=okText||'确定';
+  document.getElementById('pvCfmNo').textContent=showCheck?'取消':'关闭';
+  if(showCheck)document.getElementById('pvNoRemind').checked=false;
+  box.style.display='flex';
+  document.getElementById('pvCfmNo').onclick=function(){box.style.display='none';};
+  document.getElementById('pvCfmYes').onclick=function(){
+    if(showCheck&&document.getElementById('pvNoRemind').checked){
+      try{localStorage.setItem(PV_NOREMIND,'1')}catch(e){}
+    }
+    box.style.display='none';
+    if(onYes)onYes();
+  };
+}
 function pvShow(p,n){
   pvP=p;pvIdx=0;pvTotal=n||0;
   if(!pvEl){
     pvEl=document.createElement('div');pvEl.id='pv';
     pvEl.innerHTML='<div class="card"><div class="bar"><span id="pvTitle"></span>'+
       '<button id="pvX" type="button">关闭</button></div>'+
-      '<div class="body"><img id="pvImg" alt=""><div id="pvErr" class="err" style="display:none"></div></div>'+
+      '<div class="body"><div class="frame"><img id="pvImg" alt="">'+
+      '<span id="pvIdx" class="pvcount"></span></div>'+
+      '<div id="pvErr" class="err" style="display:none"></div></div>'+
       '<div class="foot"><button id="pvPrev" type="button">上一张</button>'+
-      '<button id="pvNext" type="button">下一张</button><span id="pvIdx" class="badge"></span>'+
-      '<button id="pvDel" class="danger" type="button">删除</button></div></div>';
+      '<button id="pvNext" type="button">下一张</button>'+
+      '<button id="pvMagic" type="button">魔术师</button>'+
+      '<button id="pvDel" class="danger" type="button">删除</button></div>'+
+      '<div id="pvCfm" class="cfm" style="display:none"><div class="cfmcard">'+
+      '<div class="cfmt" id="pvCfmt"></div><div class="cfmd" id="pvCfmd"></div>'+
+      '<label class="cfmk" id="pvCfmk"><input type="checkbox" id="pvNoRemind">不再提醒</label>'+
+      '<div class="cfmact"><button id="pvCfmNo" type="button">取消</button>'+
+      '<button id="pvCfmYes" class="danger" type="button">删除</button></div></div></div></div>';
     document.body.appendChild(pvEl);
     pvEl.addEventListener('click',function(e){if(e.target===pvEl)pvClose()});
     document.getElementById('pvX').onclick=pvClose;
-    document.getElementById('pvPrev').onclick=function(){pvIdx=Math.max(0,pvIdx-1);pvLoad()};
-    document.getElementById('pvNext').onclick=function(){pvIdx++;pvLoad()};
+    document.getElementById('pvPrev').onclick=pvPrev;
+    document.getElementById('pvNext').onclick=pvNext;
     document.getElementById('pvDel').onclick=function(){pvDelete()};
+    document.getElementById('pvMagic').onclick=function(){pvMagic()};
     document.getElementById('pvImg').onerror=function(){pvFail()};
+    /* 手机端手势：左滑下一张、右滑上一张（只认明显水平位移，避免与纵向滚动冲突） */
+    var bEl=pvEl.querySelector('.body'),tsX=0,tsY=0;
+    bEl.addEventListener('touchstart',function(e){
+      if(e.touches.length===1){tsX=e.touches[0].clientX;tsY=e.touches[0].clientY;}
+    },{passive:true});
+    bEl.addEventListener('touchend',function(e){
+      if(!e.changedTouches||e.changedTouches.length!==1)return;
+      var dx=e.changedTouches[0].clientX-tsX,dy=e.changedTouches[0].clientY-tsY;
+      if(Math.abs(dx)<45||Math.abs(dx)<Math.abs(dy)*1.4)return;
+      if(dx<0)pvNext();else pvPrev();
+    },{passive:true});
   }
   document.getElementById('pvTitle').textContent='/'+decodeURIComponent(p)+' · 按下载时间浏览';
-  document.getElementById('pvDel').textContent='删除';
   pvLoad();
 }
 function pvDelete(){
   var btn=document.getElementById('pvDel');if(!btn||btn.disabled)return;
-  if(!window.confirm('删除这张图片？'+String.fromCharCode(10)+'删除后会加入全局黑名单，以后任何采集任务扫到它都会自动跳过。'))return;
-  btn.disabled=true;
-  fetch(BASE+'/_image/delete',{method:'POST',
-    headers:{'Content-Type':'application/x-www-form-urlencoded'},
-    body:'cat='+encodeURIComponent(pvP)+'&i='+pvIdx})
-   .then(function(r){return r.json()}).then(function(j){
-     btn.disabled=false;
-     if(!j.ok){btn.textContent='删除失败';msg('删除失败：'+(j.error||'未知错误'),'warn');return;}
-     btn.textContent=j.blacklisted?'已删除·已拉黑':'已删除';
-     if(pvTotal>0)pvTotal--;
-     pvLoad();
-   }).catch(function(e){btn.disabled=false;btn.textContent='删除失败';msg('请求失败：'+e,'warn')});
+  var go=function(){
+    btn.disabled=true;
+    fetch(BASE+'/_image/delete',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'cat='+encodeURIComponent(pvP)+'&i='+pvIdx})
+     .then(function(r){return r.json()}).then(function(j){
+       if(!j.ok){btn.disabled=false;btn.textContent='删除失败';msg('删除失败：'+(j.error||'未知错误'),'warn');return;}
+       /* 删除成功后不展示任何"已删除/已拉黑"状态：图片已删，按钮状态纯属多余。
+          直接切到下一张，pvLoad() 会把按钮恢复为"删除"，全程无多余中间态。 */
+       if(pvTotal>0)pvTotal--;
+       pvLoad();
+     }).catch(function(e){btn.disabled=false;btn.textContent='删除失败';msg('请求失败：'+e,'warn')});
+  };
+  var silent=false;try{silent=localStorage.getItem(PV_NOREMIND)==='1'}catch(e){}
+  if(silent){go();return;}
+  pvAsk('删除这张图片？','删除后会加入全局黑名单，以后任何采集任务扫到它都会自动跳过。',true,'删除',go);
+}
+/* 魔术师：把「downloaded.txt 有记录但文件已被外部删除」的图片批量拉黑 */
+function pvMagic(){
+  var btn=document.getElementById('pvMagic');if(!btn||btn.disabled)return;
+  pvAsk('魔术师 · 批量拉黑',
+    '扫描所有分类，把「已下载过、但图片文件已不在」的条目批量加入全局黑名单。适合你用文件管理器删除图片后使用。',
+    false,'开始扫描',function(){
+      var old=btn.textContent;btn.disabled=true;btn.textContent='扫描中…';
+      fetch(BASE+'/_image/magician',{method:'POST'})
+       .then(function(r){return r.json()}).then(function(j){
+         btn.disabled=false;btn.textContent=old;
+         if(!j.ok){pvAsk('扫描失败',j.error||'未知错误',false,'知道了',null);return;}
+         pvAsk('魔术师完成',
+           '已扫描 '+j.scanned+' 条下载记录，发现 '+j.missing+' 张已删除的图片，新拉黑 '+j.added+' 个 ID（黑名单现共 '+j.total+' 个）。',
+           false,'知道了',null);
+       }).catch(function(e){btn.disabled=false;btn.textContent=old;pvAsk('扫描失败',String(e),false,'知道了',null)});
+    });
 }
 /* Copy buttons: delegated binding + clipboard API -> execCommand -> selectable box.
    The fnOS App embeds this page in an iframe where clipboard-write is often
@@ -2616,6 +2728,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": False, "error": payload}, 400)
         return self.send_json(payload)
 
+    def handle_image_magician(self, form):
+        ok, payload = sweep_missing_blacklist()
+        if not ok:
+            return self.send_json({"ok": False, "error": payload}, 400)
+        return self.send_json(payload)
+
     def handle_tasks_toggle(self, form):
         tid = self._form_val(form, "id")
         with _tasks_lock:
@@ -2775,6 +2893,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_reload()
             if path == "/_image/delete":
                 return self.handle_image_delete(form)
+            if path == "/_image/magician":
+                return self.handle_image_magician(form)
             if path == "/_tasks/save":
                 return self.handle_tasks_save(form)
             if path == "/_tasks/delete":
