@@ -1,6 +1,6 @@
 appname               = ranpix
-version               = 2.1.9
-changelog             = 管理页重构为左右分栏布局，改为卡片内滚动（标题固定、内容区独立滚动）。功能无变化。
+version               = 2.1.10
+changelog             = 修复手机端壁纸采集与图片压缩卡片被长文本撑宽、超出屏幕的问题。
 display_name          = RanPix
 desc                  = 一个轻量的随机图片API 应用 · 每个子文件夹就是一个独立随机图片接口 · 支持 Wallhaven 采集与图片压缩任务
 platform              = x86

@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 APPNAME = "ranpix"
 APP_TITLE = "RanPix"
-VERSION = "2.1.9"
+VERSION = "2.1.10"
 DEFAULT_PORT = 18580
 GATEWAY_PREFIX = "/app/ranpix"
 SOCKET_NAME = "ranpix.sock"
@@ -1685,9 +1685,10 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 -webkit-appearance:checkbox;appearance:checkbox;accent-color:#4a63d8}
 #pv .cfm .cfmact{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 @media(max-width:900px){
- .layout{flex-direction:column;height:100vh;height:100dvh;margin:0;padding:12px;gap:12px}
+ .layout{flex-direction:column;align-items:stretch;height:100vh;height:100dvh;margin:0;padding:12px;gap:12px}
  .side{width:100%;flex:none;height:auto;max-height:none;overflow:visible;position:static;padding:12px}
- .main{flex:1;min-height:0;height:auto}
+ /* 关键：锁定主区宽度=视口减去 padding，避免被卡片内长文本 min-content 撑破屏幕 */
+ .main{flex:1;min-height:0;height:auto;width:100%;min-width:0}
  .brand{padding-bottom:10px;margin-bottom:6px}
  .nav{flex-direction:row;overflow-x:auto;-webkit-overflow-scrolling:touch;gap:4px;padding-bottom:3px}
  .nav a{flex:0 0 auto;padding:9px 13px;font-size:13.5px}
@@ -1702,7 +1703,13 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
  .advrow>div.grow{flex:1 1 100%}
  .advrow>div.eq{flex:1 1 45%}
  .stats{gap:10px 12px}
- .api{gap:6px 8px}
+ .api{gap:6px 8px;max-width:100%}
+ .api .name{max-width:100%;min-width:0}
+ .api .name .badge{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+ .api .note{max-width:100%;min-width:0}
+ .api .acts{max-width:100%}
+ .frow>*{max-width:100%}
+ .frow input{flex:1 1 140px;width:auto;min-width:0}
  .api .acts{gap:6px}
  .api .acts button{padding:6px 9px;font-size:13px}
  .api .acts a{font-size:13px}

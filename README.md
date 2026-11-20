@@ -15,8 +15,8 @@
 
 ## 安装
 
-1. 下载最新 [Release](https://github.com/le5inioo/ranpix/releases/latest) 的 `ranpix.fpk`。
-2. 飞牛 OS → 应用中心 → 右上角菜单 → 安装本地包，选择 `ranpix.fpk`。
+1. 下载最新 [Release](https://github.com/le5inioo/ranpix/releases/latest) 的 `ranpix-<版本号>.fpk`（如 `ranpix-2.1.10.fpk`）。
+2. 飞牛 OS → 应用中心 → 右上角菜单 → 安装本地包，选择下载的 fpk 文件。
 3. 向导中设置端口（默认 `18580`）与图片根目录（留空用 `/vol1/@appshare/ranpix`）。
 4. 启动后桌面出现图标，点开即管理页。
 
@@ -53,7 +53,7 @@ https://your-nas.example.com/app/ranpix/anime    # 网关
 `fpk/` 是完整打包源，用飞牛自带 `fnpack` 在 NAS 上构建：
 
 ```bash
-fnpack build ranpix    # 生成 ranpix.fpk
+fnpack build ranpix    # 生成 ranpix.fpk，发布时重命名为 ranpix-<版本号>.fpk
 ```
 
 ## 许可证
