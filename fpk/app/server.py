@@ -40,7 +40,7 @@ from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 APPNAME = "ranpix"
 APP_TITLE = "RanPix"
-VERSION = "2.0.4"
+VERSION = "2.1.9"
 DEFAULT_PORT = 18580
 GATEWAY_PREFIX = "/app/ranpix"
 SOCKET_NAME = "ranpix.sock"
@@ -1462,35 +1462,64 @@ PAGE = Template("""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"
 --brand:#4a63d8;--ink:#1f2328;--muted:#656d76;--line:#e3e6ea;
 --c-run:#2f7de1;--c-set:#0f9b8e;--c-api:#7a5af0;--c-wall:#e0703a;--c-zip:#2f9e66;--c-help:#8a94a3}
 *{box-sizing:border-box}
-html,body{max-width:100%;overflow-x:hidden;overscroll-behavior-x:none}
-body{margin:0;background:linear-gradient(180deg,#eaf0fb 0,#f5f7fa 260px,#f5f7fa 100%);
+html,body{max-width:100%;height:100%;overflow:hidden;overscroll-behavior-x:none}
+body{margin:0;background:#f5f7fa;
 color:var(--ink);-webkit-text-size-adjust:100%;touch-action:pan-y;
 font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
 .wrap{max-width:920px;margin:26px auto 56px;padding:0 20px}
+/* two-column shell: left nav + right content */
+.layout{display:flex;gap:18px;max-width:1180px;height:100vh;height:100dvh;
+margin:0 auto;padding:18px 20px;align-items:flex-start}
+.side{width:196px;flex:0 0 196px;background:#fff;border:1px solid var(--line);border-radius:14px;
+ box-shadow:0 2px 10px rgba(31,35,40,.05);padding:14px 10px;
+ height:auto;max-height:100%;overflow-y:auto;align-self:flex-start}
+.brand{display:flex;align-items:center;gap:10px;padding:2px 8px 14px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+.brand img{width:34px;height:34px;border-radius:9px;flex:none}
+.brand b{font-size:16px;font-weight:650;color:#1f2328;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nav{display:flex;flex-direction:column;gap:3px}
+.nav a{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:9px;
+ color:#5b6472;font-size:14px;cursor:pointer;user-select:none;white-space:nowrap}
+.nav a:hover{background:#f3f6fb;color:#2b3340}
+.nav a.on{background:#eaf0ff;color:var(--brand);font-weight:600}
+.nav a svg{width:17px;height:17px;flex:none;stroke:currentColor;fill:none;stroke-width:1.8;
+ stroke-linecap:round;stroke-linejoin:round}
+/* 右侧内容区整体不滚动；卡片自己撑满高度，滚动交给卡片内部的 .card-body */
+.main{flex:1;min-width:0;height:100%;overflow:hidden;padding:0}
+.panel{display:none}
+.panel.on{display:flex;flex-direction:column;height:100%;min-height:0}
 .head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;min-width:0;
 background:linear-gradient(120deg,#4a63d8,#6a7ce8);border-radius:14px;padding:14px 18px;
 box-shadow:0 6px 18px rgba(74,99,216,.24)}
 .head img{width:44px;height:44px;border-radius:11px;flex:none}
 h1{font-size:20px;font-weight:650;color:#fff;margin:0;min-width:0;overflow-wrap:anywhere}
 .head .badge{background:rgba(255,255,255,.22);color:#fff;font-weight:500}
-p.sub{color:var(--muted);margin:12px 2px 20px;overflow-wrap:anywhere;font-size:13.5px}
-.card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;
-padding:18px 20px 18px 22px;margin-bottom:16px;min-width:0;
-box-shadow:0 2px 10px rgba(31,35,40,.05)}
-.card::before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:4px;
-background:var(--accent,#c9d0da);border-radius:12px 0 0 12px}
-.card h2{font-size:15px;font-weight:600;margin:0 0 14px;display:flex;align-items:center;gap:9px}
+/* 卡片本体固定：撑满面板高度，自身不滚动；标题栏钉在顶部，只有 .card-body 内部滚动 */
+.card{position:relative;background:#fff;border:1px solid var(--line);border-radius:12px;min-width:0;
+ box-shadow:0 2px 10px rgba(31,35,40,.05)}
+/* 卡片高度随内容自适应（短内容收缩、长内容封顶 max-height:100% 后由内部 .card-body 滚动）；
+   图片预览弹层的 .card 走自己的 #pv .card 规则，不受影响 */
+.main .card{display:flex;flex-direction:column;flex:0 1 auto;height:auto;max-height:100%;min-height:0;margin:0;overflow:hidden}
+/* padding-top 26px 使标题分割线与左侧品牌图标下的分割线精确对齐 */
+.card h2{flex:0 0 auto;font-size:15px;font-weight:600;margin:0;display:flex;align-items:center;gap:9px;
+ background:#fff;padding:26px 20px 14px 22px;border-bottom:1px solid var(--line)}
+/* 卡片内容滚动区：滚动条紧贴卡片内侧右缘，滚动只发生在这里，不带动标题和卡片 */
+.card-body{flex:0 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;
+ padding:16px 20px 20px 22px;scrollbar-gutter:stable}
 .card h2::before{content:"";width:7px;height:15px;border-radius:3px;background:var(--accent,#c9d0da);flex:none}
 .c-run{--accent:var(--c-run)}.c-set{--accent:var(--c-set)}.c-api{--accent:var(--c-api)}
 .c-wall{--accent:var(--c-wall)}.c-zip{--accent:var(--c-zip)}.c-help{--accent:var(--c-help)}
-/* 使用说明默认收起，点击标题展开；标题外观与其他卡片标题一致 */
+/* 使用说明默认收起，点击标题展开；标题固定在卡片顶部，内容在 help-body 内滚动 */
 .help-summary{list-style:none;cursor:pointer;font-size:15px;font-weight:600;
-display:flex;align-items:center;gap:8px;min-height:24px}
+display:flex;align-items:center;gap:8px;min-height:24px;
+background:#fff;padding:26px 20px 14px 22px;margin:0;border-bottom:1px solid var(--line)}
 .help-summary::after{content:"";width:7px;height:15px;border-radius:3px;background:var(--accent,#c9d0da);order:-1}
 .help-summary::-webkit-details-marker{display:none}
 .help-summary::before{content:'▸';font-size:13px;color:#656d76;flex:none;transition:transform .15s}
 #helpbox[open]>.help-summary::before{transform:rotate(90deg)}
-.help-body{padding:12px 0 0}
+/* details 撑满卡片；标题固定，正文在 help-body 内滚动 */
+#helpbox{display:flex;flex-direction:column;flex:0 1 auto;height:auto;max-height:100%;min-height:0}
+.help-body{flex:0 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;
+ padding:16px 20px 20px 22px;scrollbar-gutter:stable}
 code{background:#f1f3f5;padding:2px 6px;border-radius:5px;font-size:12.5px;
 word-break:break-all;overflow-wrap:anywhere}
 a{color:#185fa5;text-decoration:none;overflow-wrap:anywhere}
@@ -1518,6 +1547,7 @@ padding:5px 8px;border-radius:5px;box-shadow:0 3px 10px rgba(0,0,0,.18)}
 .stat .k::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--c-run);flex:none}
 .stat .v{margin-top:3px;min-width:0;overflow-wrap:anywhere;font-weight:600;font-size:13.5px}
 .apis{display:flex;flex-direction:column;gap:8px}
+#tasklist,#zlist{display:flex;flex-direction:column;gap:12px}
 .api{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;
 padding:11px 13px;border:1px solid #eef1f5;border-radius:9px;background:#fbfcfe;
 min-width:0;transition:border-color .15s,background .15s}
@@ -1654,9 +1684,17 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 #pv .cfm .cfmk input{width:16px;height:16px;min-width:0;margin:0;padding:0;
 -webkit-appearance:checkbox;appearance:checkbox;accent-color:#4a63d8}
 #pv .cfm .cfmact{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+@media(max-width:900px){
+ .layout{flex-direction:column;height:100vh;height:100dvh;margin:0;padding:12px;gap:12px}
+ .side{width:100%;flex:none;height:auto;max-height:none;overflow:visible;position:static;padding:12px}
+ .main{flex:1;min-height:0;height:auto}
+ .brand{padding-bottom:10px;margin-bottom:6px}
+ .nav{flex-direction:row;overflow-x:auto;-webkit-overflow-scrolling:touch;gap:4px;padding-bottom:3px}
+ .nav a{flex:0 0 auto;padding:9px 13px;font-size:13.5px}
+}
 @media(max-width:640px){
  .wrap{margin:16px auto 40px;padding:0 12px}
- .card{padding:14px 14px}
+ .card-body,.help-body{padding:12px 14px 16px}
  h1{font-size:19px}
  .grid>div,.grid>div.sm,.grid>div.grow{flex:1 1 100%}
  .sched .sf,.sched .sf.week{flex:1 1 100%}
@@ -1669,19 +1707,38 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
  .api .acts button{padding:6px 9px;font-size:13px}
  .api .acts a{font-size:13px}
 }
-</style></head><body><div class="wrap">
-<div class="head"><img src="$base/_icon" alt=""><h1>$title <span class="badge">v$version</span></h1></div>
-<p class="sub">一个轻量的随机图片API 应用，附带Wallhaven图片采集与图片压缩能力。</p>
-
-<div class="card c-run"><h2>运行状态</h2><div class="stats">
+</style></head><body><div class="layout">
+<aside class="side">
+<div class="brand"><img src="$base/_icon" alt=""><b>$title</b></div>
+<nav class="nav" id="nav">
+<a data-p="run" class="on" title="概览"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>概览</a>
+<a data-p="api" title="接口列表"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="7" cy="6" r="1.4" fill="currentColor" stroke="none"/><circle cx="7" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="7" cy="18" r="1.4" fill="currentColor" stroke="none"/></svg>接口列表</a>
+<a data-p="wall" title="壁纸采集"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M4 17l5-5 4 3 3-3 4 4"/></svg>壁纸采集</a>
+<a data-p="zip" title="图片压缩"><svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>图片压缩</a>
+<a data-p="set" title="设置"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.94 19.3a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.57 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.7 8.94a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.57a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.06 4.7a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.43 9v.09A1.7 1.7 0 0 0 21 10.12h.09a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.56 1.03z"/></svg>设置</a>
+<a data-p="help" title="使用说明"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.5 2.5 0 1 1 3.9 2.1c-.9.6-1.5 1.1-1.5 2.2"/><path d="M12 17.2h.01" stroke-width="2.4"/></svg>使用说明</a>
+</nav>
+</aside>
+<main class="main">
+<section class="panel on" id="panel-run">
+<div class="card c-run"><h2>运行状态</h2><div class="card-body"><div class="stats">
 <div class="stat"><div class="k">图片根目录</div><div class="v"><code>$root</code></div></div>
 <div class="stat"><div class="k">接口 / 图片</div><div class="v">$apicount 个接口 · $imgcount 张图片
 <span class="kv">（扫描缓存 $ttl 秒）</span></div></div>
 <div class="stat"><div class="k">网关入口</div><div class="v $gwclass">$gwstate</div></div>
 <div class="stat"><div class="k">目录状态</div><div class="v $stateclass">$state</div></div>
-</div></div>
+<div class="stat"><div class="k">壁纸采集任务</div><div class="v" id="ovFetch">—</div></div>
+<div class="stat"><div class="k">图片压缩任务</div><div class="v" id="ovZip">—</div></div>
+<div class="stat"><div class="k">版本号</div><div class="v">v$version</div></div>
+</div></div></div>
+</section>
 
-<div class="card c-set"><h2>设置</h2>
+<section class="panel" id="panel-api">
+<div class="card c-api"><h2>接口列表</h2><div class="card-body"><div class="apis">$rows</div></div></div>
+</section>
+
+<section class="panel" id="panel-set">
+<div class="card c-set"><h2>设置</h2><div class="card-body">
 <div class="grid">
 <div class="sm"><label for="f_port">服务端口</label><input id="f_port" type="number" min="1024" max="65535" value="$port"></div>
 <div class="grow"><label for="f_root">图片根目录（留空=自动使用已授权目录）</label>
@@ -1691,11 +1748,11 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 <div style="margin-top:14px"><button class="primary" id="save">保存并应用</button>
 <button id="reload" style="margin-left:8px">立即刷新</button></div>
 <div id="cfgmsg" class="cfgmsg"></div>
-<div id="msg"></div></div>
+<div id="msg"></div></div></div>
+</section>
 
-<div class="card c-api"><h2>接口列表</h2><div class="apis">$rows</div></div>
-
-<div class="card c-wall"><h2>Wallhaven壁纸采集</h2>
+<section class="panel" id="panel-wall">
+<div class="card c-wall"><h2>Wallhaven壁纸采集</h2><div class="card-body">
 <div class="apikeybox">
 <label for="api_key">API Key（留空则仅下载 SFW）</label>
 <div class="frow"><input id="api_key" type="password" placeholder="留空并保存=清除 Key，仅下载 SFW">
@@ -1780,9 +1837,11 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 </details>
 <div class="cfgmsg" id="tmsg"></div>
 <div class="flog" id="tlog" style="display:none"></div>
-</div>
+</div></div>
+</section>
 
-<div class="card c-zip"><h2>图片压缩</h2>
+<section class="panel" id="panel-zip">
+<div class="card c-zip"><h2>图片压缩</h2><div class="card-body">
 <p class="meta">把目录里的图片转为 JPG、限制高度与体积，原图自动备份。使用系统自带的 ffmpeg。</p>
 <div id="zlist"></div>
 <div class="frow"><button class="primary" id="znew">+ 新建压缩任务</button></div>
@@ -1825,44 +1884,43 @@ padding:18px 18px 16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
 </details>
 <div class="cfgmsg" id="zmsg"></div>
 <div class="flog" id="zlog" style="display:none"></div>
-</div>
+</div></div>
+</section>
 
-<div class="card c-help"><details id="helpbox"><summary class="help-summary">使用说明</summary><div class="help-body">
-<p class="meta">目录结构：<code>图片根目录/分类名/*.jpg</code>，支持 jpg / jpeg / png / webp / gif / bmp / tiff，子目录可再嵌套。</p>
-<p class="meta">新增接口：在图库里新建一个子文件夹并放入图片，最多等 $ttl 秒自动生效，无需重启。</p>
-<p class="meta"><b>缓存秒数</b>（当前 $ttl 秒，可设 1–3600）：服务把「图库扫描结果（各分类的图片清单）」
-在内存里保留这么久，到期才重新遍历目录。它<b>不缓存图片本身</b>，每次请求仍随机取一张并带
-<code>no-store</code>；这个数值只影响新建分类 / 增删图片后多久生效。图库大、不常改动可调大（省磁盘扫描），
-改动频繁可调小；保存设置或点设置区的「立即刷新」会立即清空缓存。</p>
-<p class="meta">接口名<b>不区分大小写</b>：<code>/Wallpaper</code>、<code>/wallpaper</code>、<code>/WALLPAPER</code> 都指向同一个分类；若图库里同时存在仅大小写不同的文件夹，需使用精确名称。</p>
-<p class="meta">自定义目录权限：应用以专用用户运行。<b>顶层文件夹</b>需到
-<b>设置 → 应用管理 → RanPix → 权限设置</b> 授权；该列表只有共享文件夹，<b>选不到子目录</b>。
-子文件夹显示「目录无读取权限」时，到 <b>文件管理 → 选中文件夹 → 详细信息 → 权限 → 高级</b>
-启用继承父级权限（或在父目录上「重置子级权限」）。根目录能读不代表每个子目录都能读。</p>
-<p class="meta">「打开看看」在当前页预览，按<b>下载时间由近到远</b>逐张浏览（上一张 / 下一张，手机可左右滑动切换）；点「删除」移除该图并加入<b>全局黑名单</b>，此后所有采集任务扫到都会跳过；用文件管理器等方式删掉的图，点「<b>魔术师</b>」可批量补进黑名单。「复制地址」始终给出<b>随机</b>接口，并<b>跟随当前访问的域名 / IP</b>，端口固定为免登录的服务端口 <code>$port</code>，
-因此复制结果可粘贴到任意浏览器或第三方应用（中文接口名自动编码）；从网关入口复制时会自动把端口换成服务端口。</p>
-<p class="meta">注意：<code>$gwurl</code> 是飞牛同源网关地址，只在已登录的桌面 / 手机 App 内有效；
-直接外传会被飞牛统一鉴权拦截，显示 <code>invalid token</code>，所以「复制地址」不会给出这种地址。</p>
-<p class="meta"><b>采集任务</b>：按界面各项配置。
-<b>循环模式</b>勾选每周一到周日中的一天或多天，在这些天的设定时刻执行；<b>全不选</b>即单次任务，
-第一次跑完自动停用。<b>下载顺序</b>：图片按接口返回顺序逐张下载，不打乱；起始页码填 0=只随机一次起始页，
-填具体数字=从该页第一张开始；之后都按页码顺序往后翻。结束页码填 0=不限（仍受 API 总页数限制）。
-<b>尺寸限制（短边≥px）</b>转换为 Wallhaven 的 <code>atleast=PxP</code>，即宽和高都不小于该值。
-排序支持热门、最近一周、收藏量、浏览量；壁纸类型与纯净度可多选，
-比例可多选（全不选为不限）。多个任务串行执行，可随时「立即运行」或「停止」，状态每 3 秒刷新。
-已下载的壁纸 ID 记在对应目录下的 <code>downloaded.txt</code>，不会重复下载；只下载原图，原图 CDN 不可达时跳过该张，绝不用缩略图代替。
-<b>API Key 留空时即使勾选了 Sketchy / NSFW 也会强制仅下载 SFW</b>；采集目录需允许应用用户写入。</p>
-<p class="meta"><b>图片压缩任务</b>：把「源目录」里的 jpg / png / bmp / tiff 图片转为 JPG，短边（宽高较小一边）超过上限按比例缩小，
-体积超过上限时逐步降低质量（下限保护细节，每次均从原图重新编码避免反复压缩）；已达标的图跳过。原图按原名备份到「备份目录」（仅一次），
-处理成功后原子替换、删掉原格式文件。<b>源目录与备份目录都要在 设置 → 应用管理 → RanPix → 权限设置 里授权</b>，
-且应用用户对两者可读写。默认路径来自原 compress.sh；使用飞牛系统自带的 ffmpeg（ffmpeg / ffprobe），无需额外安装。
-调度方式（定时/周几/单次、立即运行/停止、日志）与采集任务一致，多个任务串行执行。</p>
-<p class="meta">接口列表 <a href="$base/_apis">/_apis</a> · 健康检查 <a href="$base/_health">/_health</a> ·
-响应带 <code>no-store</code>，浏览器和 CDN 不会缓存，每次请求都是新的一张。</p>
+<section class="panel" id="panel-help">
+<div class="card c-help"><details id="helpbox" open><summary class="help-summary">使用说明</summary><div class="help-body">
+<p class="meta"><b>新增接口</b>：图库里新建子文件夹并放入图片，最多等 $ttl 秒自动生效；结构为 <code>分类名/*.jpg</code>，接口名不区分大小写。</p>
+<p class="meta"><b>缓存</b>：只缓存目录扫描结果 $ttl 秒，不缓存图片；改图后点「立即刷新」即时生效。</p>
+<p class="meta"><b>复制地址</b>：给出随机接口，跟随当前域名/IP，端口固定为 $port，可直接外链；网关地址 <code>$gwurl</code> 仅登录态可用。</p>
+<p class="meta"><b>打开看看</b>：按下载时间由近到远看图、可滑动切换；「删除」会拉黑该图，「魔术师」批量补拉黑。</p>
+<p class="meta"><b>采集任务</b>：周几全不选=单次、勾选=每周定时；按接口顺序下载、只取原图，已下载 ID 记入 <code>downloaded.txt</code>；无 API Key 时强制仅 SFW。</p>
+<p class="meta"><b>压缩任务</b>：源目录图片转 JPG，短边超限则缩小、体积超限则降质，原图备份一次；用系统 ffmpeg。源目录与备份目录需在应用权限中授权。</p>
+<p class="meta">接口 <a href="$base/_apis">/_apis</a> · 健康检查 <a href="$base/_health">/_health</a></p>
 </div></details></div>
+</section>
+</main></div>
 <script>
 var BASE='$base', GATEWAY=$gateway, DIRECT='$direct', PORT=$port;
 var TDEF=$tdef, CDEF=$cdef;
+/* two-column nav: switch panels, remember last tab */
+function switchTab(p){
+  var navs=document.querySelectorAll('#nav a'),ps=document.querySelectorAll('.panel');
+  for(var i=0;i<navs.length;i++)navs[i].classList.toggle('on',navs[i].getAttribute('data-p')===p);
+  for(var j=0;j<ps.length;j++)ps[j].classList.toggle('on',ps[j].id==='panel-'+p);
+  try{localStorage.setItem('ranpix_tab',p)}catch(e){}
+  /* 卡片内滚动方案：切回面板时把它的内容滚动区复位到顶部 */
+  var active=document.querySelector('.panel.on');
+  if(active){var b=active.querySelector('.card-body,.help-body');if(b)b.scrollTop=0;}
+}
+(function(){
+  var navs=document.querySelectorAll('#nav a');
+  for(var i=0;i<navs.length;i++)(function(a){
+    a.onclick=function(){switchTab(a.getAttribute('data-p'));};
+  })(navs[i]);
+  var last='run';try{last=localStorage.getItem('ranpix_tab')||'run'}catch(e){}
+  if(!document.getElementById('panel-'+last))last='run';
+  switchTab(last);
+})();
 function msg(t,c){var e=document.getElementById('msg');e.textContent=t;e.className=c||'';}
 function gwUrl(p){return location.protocol+'//'+location.host+BASE+'/'+p;}
 /* Shareable URL: follow whatever host the user is currently visiting, but
@@ -2294,6 +2352,24 @@ function zResetForm(){
 }
 var zEditingId='';
 var knownTasks={};
+/* 概览里的采集 / 压缩运行状态汇总（数据来自 /_tasks 轮询） */
+function overviewTaskStatus(){
+  var f={n:0,en:0,run:null,last:null},z={n:0,en:0,run:null,last:null};
+  for(var id in knownTasks){var t=knownTasks[id],isZip=(t.type==='compress'),g=isZip?z:f;
+    g.n++;if(t.enabled)g.en++;
+    if(t.running&&!g.run)g.run=t;
+    if(t.last_run&&(!g.last||t.last_run>g.last.last_run))g.last=t;
+  }
+  function text(g,isZip,doing){
+    var e=document.getElementById(isZip?'ovZip':'ovFetch');if(!e)return;
+    if(g.run){e.className='v ok';e.textContent=doing+' · '+(g.run.done||0)+'/'+(g.run.total||0);return;}
+    if(!g.n){e.className='v';e.textContent='无任务';return;}
+    var s=g.en+' 启用 / '+g.n+' 个',dict=isZip?ZSTATUS:TSTATUS;
+    if(g.last&&g.last.last_status)s+=' · '+(dict[g.last.last_status]||g.last.last_status);
+    e.className='v';e.textContent=s;
+  }
+  text(f,false,'采集中');text(z,true,'压缩中');
+}
 function poll(){
   fetch(BASE+'/_tasks',{cache:'no-store'})
    .then(function(r){return r.json()}).then(function(j){
@@ -2302,6 +2378,7 @@ function poll(){
      knownTasks={};for(var i=0;i<j.tasks.length;i++)knownTasks[j.tasks[i].id]=j.tasks[i];
      renderTasks(j.tasks,j.now);
      renderZipTasks(j.tasks,j.now);
+     overviewTaskStatus();
      var running=null,zipRunning=null;
      for(var id in knownTasks){var tk=knownTasks[id];if(tk.running){
        if(tk.type==='compress'){if(!zipRunning)zipRunning=tk;}
